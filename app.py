@@ -46,15 +46,16 @@ def login_required(f):
 
 # --- Giao diện Web (HTML) ---
 
-# Giao diện Đăng Nhập
+# Giao diện Đăng Nhập MỚI (Theo yêu cầu)
 HTML_LOGIN = """
 <!DOCTYPE html>
 <html lang="vi">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Đăng Nhập - Bot Saldo</title>
+    <title>Đăng Nhập - Bot của Admin Văn Linh</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         body { 
             font-family: 'Inter', sans-serif;
@@ -62,12 +63,28 @@ HTML_LOGIN = """
             background-image: radial-gradient(circle at 1px 1px, rgba(200, 200, 255, 0.1) 1px, transparent 0);
             background-size: 20px 20px;
         }
+        /* Thêm style cho vòng tròn tích xanh */
+        .verified-badge {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0; /* Ngăn co lại */
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            background-color: #3b82f6; /* Màu xanh (blue-500) */
+            color: white;
+            font-weight: bold;
+            font-size: 12px;
+            margin-left: 8px; /* Khoảng cách với text */
+        }
     </style>
 </head>
-<body class="text-gray-200 min-h-screen flex items-center justify-center">
+<body class="text-gray-200 min-h-screen flex items-center justify-center p-4">
     <div class="max-w-md w-full bg-gray-800/70 backdrop-blur-sm rounded-lg shadow-2xl p-8 border border-gray-700">
-        <h2 class="text-3xl font-bold text-center bg-clip-text text-transparent bg-gradient-to-r from-purple-400 to-cyan-400 mb-6">
-            Bot Saldo
+        <h2 class="text-2xl font-bold text-center bg-clip-text text-transparent bg-gradient-to-r from-purple-400 to-cyan-400 mb-6 flex items-center justify-center">
+            <span>Bot được Build và phát triển bởi Admin Văn Linh</span>
+            <span class="verified-badge">✓</span>
         </h2>
         
         {% with messages = get_flashed_messages(with_categories=true) %}
