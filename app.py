@@ -480,7 +480,7 @@ def check_balances():
     except Exception as e:
         print(f"Lỗi khi đọc CSDL: {e}", file=sys.stderr)
         if "no such table" in str(e):
-            init_db()
+            init_db() # Cố gắng tạo lại CSDL nếu nó bị mất
         return
 
     for acc in accounts:
@@ -623,6 +623,10 @@ def dashboard():
         return render_template_string(HTML_TEMPLATE, accounts=accounts, all_bots=all_bots, settings=settings)
     except Exception as e:
         flash(f"Lỗi khi tải dữ liệu: {e}", 'error')
+        # Nếu lỗi là "no such table", hãy cố gắng tạo lại CSDL
+        if 'no such table' in str(e):
+            init_db()
+            flash('Lỗi CSDL: Đã thử khởi tạo lại. Vui lòng F5 trang.', 'error')
         return render_template_string(HTML_TEMPLATE, accounts=[], all_bots=[], settings={})
 
 # --- Các route chức năng ---
@@ -909,26 +913,29 @@ def import_json():
         
     return redirect(url_for('dashboard'))
 
-# --- Chạy ứng dụng ---
-scheduler = BackgroundScheduler()
+# --- SỬA LỖI "no such table" ---
+# Di chuyển 2 khối code này ra khỏi 'if __name__ == "__main__":'
+# để Gunicorn có thể chạy chúng.
 
+# 1. Khởi tạo CSDL ngay lập tức khi file được import
+print("Đang khởi tạo CSDL...")
+init_db()
+print("Khởi tạo CSDL hoàn tất.")
+
+# 2. Khởi động Scheduler
+scheduler = BackgroundScheduler()
+scheduler.add_job(func=check_balances, trigger="interval", minutes=2)
+scheduler.start()
+print(f"Trình lập lịch đã bắt đầu, kiểm tra mỗi 2 PHÚT.")
+
+import atexit
+atexit.register(lambda: scheduler.shutdown())
+
+
+# 3. Khối __name__ == "__main__" chỉ còn dùng để test local
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 8080))
-    
-    # Chạy init_db trong một thread riêng để không block
-    db_init_thread = threading.Thread(target=init_db)
-    db_init_thread.start()
-    db_init_thread.join() # Chờ cho CSDL sẵn sàng
-    
-    # Lập lịch kiểm tra mỗi 2 phút
-    scheduler.add_job(func=check_balances, trigger="interval", minutes=2)
-    scheduler.start()
-    print(f"Trình lập lịch đã bắt đầu, kiểm tra mỗi 2 PHÚT.")
-    
-    import atexit
-    atexit.register(lambda: scheduler.shutdown())
-
-    print(f"Khởi chạy web server tại http://0.0.0.0:{port}")
+    print(f"Khởi chạy web server (test local) tại http://0.0.0.0:{port}")
     print(f"Truy cập trang chủ để đăng nhập.")
-    # Gunicorn sẽ xử lý việc chạy app, không cần app.run()
-    # app.run(host='0.0.0.0', port=port) # Chỉ để test local
+    # Không chạy scheduler.start() hay init_db() ở đây nữa
+    app.run(host='0.0.0.0', port=port)
