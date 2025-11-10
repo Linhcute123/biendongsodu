@@ -1,8 +1,7 @@
 services:
   - type: web
-    name: saldo-bot
+    name: biendongsodu
     env: python
-    pythonVersion: "3.11"
     
     # Lệnh cài đặt thư viện
     buildCommand: "pip install -r requirements.txt"
@@ -12,7 +11,7 @@ services:
     
     # Biến môi trường
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.11" # <--- Di chuyển vào đây
       - key: adminlinhdz
-        # Đặt giá trị cho key của bạn ở đây
-        # Hoặc tốt hơn là vào tab "Environment" trên Render để cài đặt
         value: "adminlinhdz"
