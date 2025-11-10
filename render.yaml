@@ -2,23 +2,17 @@ services:
   - type: web
     name: saldo-bot
     env: python
-    pythonVersion: "3.11" # Bạn có thể chọn phiên bản Python mới hơn nếu muốn
+    pythonVersion: "3.11"
     
-    # 1. Định nghĩa ổ đĩa lưu trữ
-    disks:
-      - name: data-disk
-        mountPath: /data # Đây chính là đường dẫn '/data' trong code của bạn
-        sizeGB: 1        # 1GB là đủ cho file SQLite
-        
-    # 2. Lệnh để cài đặt các thư viện
+    # Lệnh cài đặt thư viện
     buildCommand: "pip install -r requirements.txt"
     
-    # 3. Lệnh để chạy ứng dụng (sử dụng Gunicorn cho production)
+    # Lệnh chạy ứng dụng
     startCommand: "gunicorn app:app"
     
-    # 4. Các biến môi trường
-    # KHÔNG ĐIỀN GIÁ TRỊ VÀO ĐÂY!
-    # Hãy thêm chúng vào tab "Environment" trong Dashboard của Render.
+    # Biến môi trường
     envVars:
-      - key: admin
       - key: adminlinhdz
+        # Đặt giá trị cho key của bạn ở đây
+        # Hoặc tốt hơn là vào tab "Environment" trên Render để cài đặt
+        value: "adminlinhdz"
