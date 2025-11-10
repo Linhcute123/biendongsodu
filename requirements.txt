@@ -1,5 +1,4 @@
 flask
-flask-httpauth
 requests
-python-telegram-bot
-werkzeug
+python-dotenv
+apscheduler
