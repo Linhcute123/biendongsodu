@@ -13,8 +13,7 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.10
-      - key: admin
-        # 'fromAdmin' sẽ khiến Render HỎI BẠN
+      - key: SECRET_PATH
+        # 'fromAdmin: true' sẽ khiến Render HỎI BẠN
         # nhập đường dẫn bí mật lúc deploy.
-        # HÃY NHẬP MỘT CHUỖI KHÓ ĐOÁN!
         fromAdmin: true
