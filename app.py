@@ -14,7 +14,7 @@ from flask import (
     url_for,
     session,
     flash,
-    abort,
+    Response,
 )
 
 # =========================
@@ -22,11 +22,10 @@ from flask import (
 # =========================
 
 APP_TITLE = "Balance Watcher Universe"
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))  # giây giữa các lần quét
+# Chu kỳ quét: 2 phút (120 giây) là tần suất an toàn và hợp lý
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "120"))
 
-# Dùng CHUNG 1 mật khẩu:
-# - ADMIN_PASSWORD: dùng để đăng nhập dashboard
-# - SECRET_KEY Flask: nếu không set riêng thì = ADMIN_PASSWORD
+# Biến môi trường
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "changeme")
 SECRET_KEY = os.getenv("SECRET_KEY", ADMIN_PASSWORD)
 
@@ -239,9 +238,7 @@ DASHBOARD_TEMPLATE = r"""
     </div>
 
     <div class="max-w-6xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-5 items-start">
-        <!-- Cột trái: Settings + Bots + Backup -->
         <div class="space-y-5">
-            <!-- Cài đặt chung -->
             <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
                 <div class="flex items-center justify-between gap-2 mb-3">
                     <h2 class="text-sm font-semibold text-indigo-300 uppercase tracking-[0.16em]">Cài đặt chung</h2>
@@ -276,7 +273,6 @@ DASHBOARD_TEMPLATE = r"""
                 </form>
             </div>
 
-            <!-- Quản lý Bot -->
             <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
                 <div class="flex items-center justify-between mb-3">
                     <h2 class="text-sm font-semibold text-cyan-300 uppercase tracking-[0.16em]">Quản lý Bot Telegram</h2>
@@ -330,7 +326,6 @@ DASHBOARD_TEMPLATE = r"""
                 </div>
             </div>
 
-            <!-- Backup -->
             <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
                 <div class="flex items-center justify-between mb-3">
                     <h2 class="text-sm font-semibold text-fuchsia-300 uppercase tracking-[0.16em]">Backup dữ liệu</h2>
@@ -345,9 +340,7 @@ DASHBOARD_TEMPLATE = r"""
             </div>
         </div>
 
-        <!-- Cột phải: Danh sách API đang theo dõi -->
         <div class="lg:col-span-2 space-y-5">
-            <!-- Thêm API mới -->
             <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
                 <div class="flex items-center justify-between gap-2 mb-3">
                     <h2 class="text-sm font-semibold text-sky-300 uppercase tracking-[0.16em]">Thêm API số dư</h2>
@@ -383,7 +376,6 @@ DASHBOARD_TEMPLATE = r"""
                 </form>
             </div>
 
-            <!-- Danh sách API -->
             <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
                 <div class="flex items-center justify-between mb-3">
                     <h2 class="text-sm font-semibold text-indigo-300 uppercase tracking-[0.16em]">Danh sách API đang theo dõi</h2>
@@ -414,7 +406,7 @@ DASHBOARD_TEMPLATE = r"""
                                 <td class="px-3 py-2">
                                     {% if api.last_balance is not none %}
                                         <span class="inline-flex px-2 py-0.5 rounded-full bg-emerald-900/40 text-emerald-300">
-                                            {{ api.last_balance }}
+                                            {{ "{:,.0f}đ".format(api.last_balance) }}
                                         </span>
                                     {% else %}
                                         <span class="inline-flex px-2 py-0.5 rounded-full bg-slate-800 text-slate-400">
@@ -458,6 +450,9 @@ DASHBOARD_TEMPLATE = r"""
 
 def init_db():
     with db_lock:
+        # Đảm bảo thư mục tồn tại (cần thiết nếu DATA_DIR là /data)
+        os.makedirs(os.path.dirname(DB_PATH) or '.', exist_ok=True)
+        
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
 
@@ -588,6 +583,11 @@ def update_api_state(api_id: int, balance: float, changed_at: str):
 # UTIL: JSON FIELD & BALANCE
 # =========================
 
+def format_currency(amount: Optional[float]) -> str:
+    if amount is None:
+        return "N/A"
+    return f"{amount:,.0f}đ"
+
 def extract_balance(data: Any, path: str) -> Optional[float]:
     """
     Lấy trường số dư từ JSON theo path dạng 'balance' hoặc 'data.balance'.
@@ -644,7 +644,7 @@ def watcher_loop():
 
             default_chat_id = (settings.get("default_chat_id") or "").strip()
             default_bot_id = settings.get("default_bot_id") or ""
-            last_run_str = datetime.utcnow().isoformat() + "Z"
+            last_run_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
             set_setting("last_run", last_run_str)
 
             # Xác định danh sách token sẽ dùng
@@ -676,6 +676,10 @@ def watcher_loop():
                     resp.raise_for_status()
                     data = resp.json()
                 except Exception:
+                    # Gửi cảnh báo lỗi API
+                    error_msg = f"❌ LỖI API ({name})\nKhông thể kết nối hoặc API phản hồi lỗi."
+                    if default_chat_id and tokens_to_use:
+                        send_telegram(tokens_to_use, default_chat_id, error_msg)
                     continue
 
                 new_balance = extract_balance(data, field)
@@ -683,6 +687,10 @@ def watcher_loop():
                     new_balance = extract_balance(data, "balance")
 
                 if new_balance is None:
+                    # Gửi cảnh báo lỗi đọc số dư
+                    error_msg = f"⚠️ LỖI CẤU HÌNH ({name})\nKhông tìm thấy trường số dư (<code>{field}</code>) trong phản hồi API. Vui lòng kiểm tra lại trường số dư."
+                    if default_chat_id and tokens_to_use:
+                        send_telegram(tokens_to_use, default_chat_id, error_msg)
                     continue
 
                 # Lần đầu chỉ lưu
@@ -696,22 +704,23 @@ def watcher_loop():
                     update_api_state(api_id, new_balance, api.get("last_change") or last_run_str)
                     continue
 
-                # Phân loại biến động
+                # Phân loại biến động (CỘNG/TRỪ)
                 if diff > 0:
                     change_type = "CỘNG TIỀN"
-                    icon = "🟢"
-                    desc = "Nạp tiền / cộng số dư"
+                    icon = "💰"
+                    desc = "Nạp tiền vào tài khoản"
+                    sign = "+"
                 else:
                     change_type = "THANH TOÁN"
-                    icon = "🔴"
-                    desc = "Thanh toán / trừ số dư"
+                    icon = "✅"
+                    desc = "Thanh toán đơn hàng"
+                    sign = "-"
 
                 msg = (
                     f"{icon} <b>{change_type}</b> tại <b>{name}</b>\n"
-                    f"Mô tả: {desc}\n"
-                    f"Số dư cũ: <code>{old_balance}</code>\n"
-                    f"Biến động: <code>{diff:+}</code>\n"
-                    f"Số dư mới: <b><code>{new_balance}</code></b>\n"
+                    f"Nội dung: {desc}\n"
+                    f"Biến động: <b><code>{sign}{format_currency(abs(diff))}</code></b>\n"
+                    f"Số dư cuối: <b><code>{format_currency(new_balance)}</code></b>\n"
                     f"Thời gian (UTC): <code>{last_run_str}</code>"
                 )
 
@@ -779,7 +788,13 @@ def dashboard():
 
     settings = SettingsObj(settings_raw)
 
-    apis = [type("ApiObj", (), a) for a in apis_raw]
+    class ApiObj:
+        def __init__(self, d):
+            for k, v in d.items():
+                setattr(self, k, v)
+            self.last_balance_formatted = format_currency(self.last_balance)
+
+    apis = [ApiObj(a) for a in apis_raw]
     last_run = settings_raw.get("last_run", "") or ""
 
     return render_template_string(
@@ -859,11 +874,28 @@ def test_bot():
 
     text = (
         "✅ <b>Test thành công</b>\n"
-        "Bot đã kết nối và có thể gửi thông báo.\n"
-        "Từ giờ các biến động số dư hợp lệ sẽ được đẩy về đây."
+        f"Bot <b>{bot['bot_name']}</b> đã kết nối và có thể gửi thông báo.\n"
+        "Báo cáo tổng quan về số dư các API đã cấu hình:\n\n"
     )
-    send_telegram([bot["bot_token"]], chat_id, text)
-    flash("Đã gửi test message đến Telegram.", "ok")
+    
+    apis = get_apis()
+    if apis:
+        for api in apis:
+            balance_str = format_currency(api['last_balance'])
+            status_str = "chưa có dữ liệu" if api['last_balance'] is None else "OK"
+            
+            text += f"🌐 <b>{api['name']}</b>:\n"
+            text += f"   - Số dư cuối: <b><code>{balance_str}</code></b>\n"
+            text += f"   - Trạng thái: {status_str}\n"
+    else:
+        text += "<i>Chưa có API nào được cấu hình.</i>"
+
+    success, error = send_telegram([bot["bot_token"]], chat_id, text)
+    if success:
+        flash("Đã gửi test message và báo cáo tổng quan đến Telegram.", "ok")
+    else:
+        flash(f"Lỗi gửi test message: {error}", "error")
+
     return redirect(url_for("dashboard"))
 
 @app.route("/add_api", methods=["POST"])
@@ -889,7 +921,6 @@ def delete_api(api_id: int):
 @app.route("/download_backup")
 def download_backup():
     import json
-    from flask import Response
 
     data = {
         "settings": get_settings(),
