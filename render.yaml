@@ -2,19 +2,16 @@ services:
   - type: web
     name: saldo-bot
     env: python
-    plan: free # BẮT BUỘC: Để dùng gói Miễn Phí
+    plan: free 
 
     # Lệnh cài đặt thư viện
     buildCommand: "pip install -r requirements.txt"
     
-    # Lệnh chạy ứng dụng
-    startCommand: "gunicorn app:app"
+    # Lệnh chạy ứng dụng (ĐÃ SỬA)
+    startCommand: "gunicorn app:app --bind 0.0.0.0:$PORT"
     
     # Biến môi trường
     envVars:
       - key: PYTHON_VERSION
-        value: "3.11.9" # Sửa lỗi phiên bản 3.11
-      
-      # QUAN TRỌNG: Tên (Key) BẮT BUỘC phải là ADMIN_PASSWORD
-      # Bạn hãy vào tab "Environment" trên Render và tự đặt GIÁ TRỊ (Value)
+        value: "3.11.9"
       - key: ADMIN_PASSWORD
