@@ -3,36 +3,98 @@ import sqlite3
 import requests
 import threading
 import sys
-from flask import Flask, render_template_string, request, redirect, url_for, session, flash, send_file, abort
+import json
+import io
+import functools # Cần cho decorator đăng nhập
+
+from flask import (
+    Flask, render_template_string, request, redirect, url_for, 
+    session, flash, send_file, abort, Response, jsonify
+)
 from apscheduler.schedulers.background import BackgroundScheduler
 from urllib.parse import urlparse
 from werkzeug.utils import secure_filename
 
 # --- Cấu hình ---
-# LẤY ĐƯỜNG DẪN BÍ MẬT TỪ BIẾN MÔI TRƯỜNG
-# THAY THẾ CHO ADMIN_PASSWORD
-SECRET_PATH = os.environ.get('SECRET_PATH')
-if not SECRET_PATH:
-    # Nếu không đặt, tự tạo một đường dẫn ngẫu nhiên để tránh bị lộ
-    print("CẢNH BÁO: SECRET_PATH chưa được đặt. Sử dụng đường dẫn ngẫu nhiên.", file=sys.stderr)
-    SECRET_PATH = os.urandom(16).hex()
-    print(f"Đường dẫn truy cập tạm thời là: /{SECRET_PATH}", file=sys.stderr)
+# 1. KEY BÍ MẬT (DÙNG ĐỂ ĐĂNG NHẬP VÀ LÀM SECRET KEY)
+# Lấy từ biến môi trường của Render
+ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD')
+if not ADMIN_PASSWORD:
+    print("CẢNH BÁO: ADMIN_PASSWORD chưa được đặt. Đặt thành 'admin' cho mục đích test.", file=sys.stderr)
+    ADMIN_PASSWORD = 'admin'
 
+# Dùng chung một key cho cả hai việc
 app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', os.urandom(24))
-
-# --- Cấu hình CSDL (Render Disk) ---
-RENDER_DISK_PATH = '/data'
-DATABASE_FILE = os.path.join(RENDER_DISK_PATH, 'accounts.db')
-
-if not os.path.exists(RENDER_DISK_PATH):
-    print("Cảnh báo: Không tìm thấy đường dẫn /data. Sẽ lưu CSDL tại thư mục hiện tại.", file=sys.stderr)
-    DATABASE_FILE = 'accounts.db'
-else:
-    print(f"Sử dụng CSDL tại: {DATABASE_FILE}")
+app.secret_key = ADMIN_PASSWORD # Dùng ADMIN_PASSWORD làm SECRET_KEY
 
 
-# --- Giao diện Web (HTML + Tailwind CSS) ---
+# --- Cấu hình CSDL (Render Free Tier) ---
+# Luôn lưu CSDL ở thư mục gốc của dự án
+DATABASE_FILE = 'accounts.db'
+print(f"Sử dụng CSDL tại: {DATABASE_FILE}")
+
+
+# --- Decorator: Yêu cầu đăng nhập ---
+def login_required(f):
+    @functools.wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'authenticated' not in session:
+            flash('Bạn phải đăng nhập để xem trang này.', 'error')
+            return redirect(url_for('login_page'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+# --- Giao diện Web (HTML) ---
+
+# Giao diện Đăng Nhập
+HTML_LOGIN = """
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Đăng Nhập - Bot Saldo</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { 
+            font-family: 'Inter', sans-serif;
+            background-color: #0B1120;
+            background-image: radial-gradient(circle at 1px 1px, rgba(200, 200, 255, 0.1) 1px, transparent 0);
+            background-size: 20px 20px;
+        }
+    </style>
+</head>
+<body class="text-gray-200 min-h-screen flex items-center justify-center">
+    <div class="max-w-md w-full bg-gray-800/70 backdrop-blur-sm rounded-lg shadow-2xl p-8 border border-gray-700">
+        <h2 class="text-3xl font-bold text-center bg-clip-text text-transparent bg-gradient-to-r from-purple-400 to-cyan-400 mb-6">
+            Bot Saldo
+        </h2>
+        
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}
+            {% for category, message in messages %}
+              <div class="bg-red-900 border-red-500 text-red-300 border-l-4 px-4 py-3 rounded-lg relative mb-4" role="alert">
+                <span class="block sm:inline">{{ message }}</span>
+              </div>
+            {% endfor %}
+          {% endif %}
+        {% endwith %}
+        
+        <form action="{{ url_for('login_handler') }}" method="POST" class="space-y-6">
+            <div>
+                <label for="secret_key" class="block text-sm font-medium text-gray-400">Secret Key</label>
+                <input type="password" name="secret_key" id="secret_key" placeholder="Nhập key bí mật của bạn" class="mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-cyan-500 focus:border-cyan-500 text-white" required>
+            </div>
+            <button type="submit" class="w-full inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-blue-500 transition-all">
+                Truy Cập
+            </button>
+        </form>
+    </div>
+</body>
+</html>
+"""
+
+# Giao diện Bảng Điều Khiển
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="vi">
@@ -47,7 +109,7 @@ HTML_TEMPLATE = """
     <style>
         body { 
             font-family: 'Inter', sans-serif;
-            background-color: #0B1120; /* Nền tối đậm */
+            background-color: #0B1120;
             background-image: radial-gradient(circle at 1px 1px, rgba(200, 200, 255, 0.1) 1px, transparent 0);
             background-size: 20px 20px;
         }
@@ -70,7 +132,7 @@ HTML_TEMPLATE = """
             <h1 class="text-4xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-purple-400 to-cyan-400">
                 Bảng Điều Khiển Saldo Bot
             </h1>
-            <span class="text-sm text-gray-500">Đã kết nối an toàn.</span>
+            <a href="{{ url_for('logout') }}" class="text-sm text-gray-500 hover:text-red-400 transition-colors">Đăng Xuất</a>
         </div>
         
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -79,7 +141,7 @@ HTML_TEMPLATE = """
                 
                 <div class="bg-gray-800/70 backdrop-blur-sm rounded-lg shadow-2xl p-6 border border-gray-700">
                     <h2 class="text-xl font-semibold text-cyan-400 mb-5 border-b border-gray-700 pb-2">Cài Đặt Chung</h2>
-                    <form action="{{ url_for('update_settings', secret_path=secret_path) }}" method="POST" class="space-y-4">
+                    <form action="{{ url_for('update_settings') }}" method="POST" class="space-y-4">
                         <div>
                             <label for="default_chat_id" class="block text-sm font-medium text-gray-400">Chat ID Mặc Định</label>
                             <input type="text" name="default_chat_id" id="default_chat_id" value="{{ settings.get('default_chat_id', '') }}" placeholder="ID của bạn hoặc nhóm (ví dụ: -1001...)" class="mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-cyan-500 focus:border-cyan-500 text-white">
@@ -101,7 +163,7 @@ HTML_TEMPLATE = """
 
                 <div class="bg-gray-800/70 backdrop-blur-sm rounded-lg shadow-2xl p-6 border border-gray-700">
                     <h2 class="text-xl font-semibold text-cyan-400 mb-5 border-b border-gray-700 pb-2">Quản Lý Bot Telegram</h2>
-                    <form action="{{ url_for('add_bot', secret_path=secret_path) }}" method="POST" class="space-y-4 mb-6">
+                    <form action="{{ url_for('add_bot') }}" method="POST" class="space-y-4 mb-6">
                         <div>
                             <label for="bot_name" class="block text-sm font-medium text-gray-400">Tên Bot (để phân biệt)</label>
                             <input type="text" name="bot_name" id="bot_name" placeholder="Ví dụ: Bot Cảnh Báo" class="mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-cyan-500 focus:border-cyan-500 text-white" required>
@@ -121,12 +183,12 @@ HTML_TEMPLATE = """
                         <li class="py-3 flex items-center justify-between">
                             <span class="text-sm text-gray-300">{{ bot.bot_name }} {% if settings.get('default_bot_id') == bot.id|string %}<span class="text-xs text-purple-400">(Mặc định)</span>{% endif %}</span>
                             <div class="flex space-x-3">
-                                <form action="{{ url_for('test_bot', secret_path=secret_path) }}" method="POST" class="inline">
+                                <form action="{{ url_for('test_bot') }}" method="POST" class="inline">
                                     <input type="hidden" name="bot_id" value="{{ bot.id }}">
                                     <input type="hidden" name="bot_name" value="{{ bot.bot_name }}">
                                     <button type="submit" class="text-cyan-400 hover:text-cyan-300 text-sm font-medium transition-colors">Test</button>
                                 </form>
-                                <form action="{{ url_for('delete_bot', secret_path=secret_path) }}" method="POST" class="inline" onsubmit="return confirm('Bạn có chắc chắn muốn xóa bot này?');">
+                                <form action="{{ url_for('delete_bot') }}" method="POST" class="inline" onsubmit="return confirm('Bạn có chắc chắn muốn xóa bot này?');">
                                     <input type="hidden" name="id" value="{{ bot.id }}">
                                     <button type="submit" class="text-red-500 hover:text-red-400 text-sm font-medium transition-colors">Xóa</button>
                                 </form>
@@ -148,7 +210,7 @@ HTML_TEMPLATE = """
                     </div>
                     {% endif %}
                     
-                    <form action="{{ url_for('add_account', secret_path=secret_path) }}" method="POST" class="space-y-4">
+                    <form action="{{ url_for('add_account') }}" method="POST" class="space-y-4">
                         <div>
                             <label for="web_name" class="block text-sm font-medium text-gray-400">Tên Website</label>
                             <input type="text" name="web_name" id="web_name" placeholder="Ví dụ: ShopACCMO" class="mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md shadow-sm text-white" required>
@@ -188,19 +250,19 @@ HTML_TEMPLATE = """
                 </div>
 
                 <div class="bg-gray-800/70 backdrop-blur-sm rounded-lg shadow-2xl p-6 border border-gray-700">
-                    <h2 class="text-xl font-semibold text-cyan-400 mb-5 border-b border-gray-700 pb-2">Quản Lý Dữ Liệu</h2>
+                    <h2 class="text-xl font-semibold text-cyan-400 mb-5 border-b border-gray-700 pb-2">Quản Lý Dữ Liệu (JSON)</h2>
                     <div class="grid grid-cols-1 gap-4">
                         <div>
                             <h3 class="text-lg font-medium text-gray-300 mb-2">Tải Backup (Export)</h3>
-                            <a href="{{ url_for('export_db', secret_path=secret_path) }}" class="w-full inline-flex justify-center py-2 px-4 border border-gray-600 shadow-sm text-sm font-medium rounded-md text-gray-200 bg-gray-600 hover:bg-gray-500 transition-colors">
-                                Tải Backup
+                            <a href="{{ url_for('export_json') }}" class="w-full inline-flex justify-center py-2 px-4 border border-gray-600 shadow-sm text-sm font-medium rounded-md text-gray-200 bg-gray-600 hover:bg-gray-500 transition-colors">
+                                Tải Backup (.json)
                             </a>
                         </div>
                         <div>
                             <h3 class="text-lg font-medium text-gray-300 mb-2">Restore từ Backup (Import)</h3>
-                            <form action="{{ url_for('import_db', secret_path=secret_path) }}" method="POST" enctype="multipart/form-data" 
-                                  onsubmit="return confirm('Bạn có chắc chắn muốn GHI ĐÈ toàn bộ dữ liệu hiện tại không?');">
-                                <input type="file" name="backup_file" accept=".db" required class="block w-full text-sm text-gray-400
+                            <form action="{{ url_for('import_json') }}" method="POST" enctype="multipart/form-data" 
+                                  onsubmit="return confirm('BẠN CÓ CHẮC CHẮN MUỐN GHI ĐÈ TOÀN BỘ DỮ LIỆU HIỆN TẠI BẰNG FILE NÀY KHÔNG?');">
+                                <input type="file" name="backup_file" accept=".json" required class="block w-full text-sm text-gray-400
                                   file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-semibold
                                   file:bg-gray-700 file:text-cyan-400 hover:file:bg-gray-600 mb-2 transition-colors"/>
                                 <button type="submit" class="w-full inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-gradient-to-r from-red-600 to-orange-500 hover:from-red-700 hover:to-orange-600 transition-all">
@@ -210,8 +272,7 @@ HTML_TEMPLATE = """
                         </div>
                     </div>
                 </div>
-
-            </div>
+                </div>
             
             <div class="lg:col-span-2">
                 <div class="bg-gray-800/70 backdrop-blur-sm rounded-lg shadow-2xl p-6 md:p-8 border border-gray-700">
@@ -259,7 +320,7 @@ HTML_TEMPLATE = """
                                         {% endif %}
                                     </td>
                                     <td class="px-5 py-4 whitespace-nowrap text-right text-sm font-medium">
-                                        <form action="{{ url_for('delete_account', secret_path=secret_path) }}" method="POST" onsubmit="return confirm('Bạn có chắc chắn muốn xóa tài khoản web này?');">
+                                        <form action="{{ url_for('delete_account') }}" method="POST" onsubmit="return confirm('Bạn có chắc chắn muốn xóa tài khoản web này?');">
                                             <input type="hidden" name="id" value="{{ acc.id }}">
                                             <button type="submit" class="text-red-500 hover:text-red-400 transition-colors">Xóa</button>
                                         </form>
@@ -277,7 +338,6 @@ HTML_TEMPLATE = """
 </html>
 """
 
-# HTML_LOGIN đã bị xóa vì không còn đăng nhập
 
 # --- Khởi tạo CSDL ---
 def init_db():
@@ -318,41 +378,19 @@ def init_db():
             )
         ''')
         
+        # Logic kiểm tra và nâng cấp CSDL cũ (quan trọng, không xóa)
         try:
             c.execute("PRAGMA table_info(accounts)")
             cols = c.fetchall()
-            chat_id_col = next((col for col in cols if col[1] == 'chat_id'), None)
+            has_bot_id = any(col[1] == 'bot_id' for col in cols)
             
-            if chat_id_col and chat_id_col[3] == 1: 
-                print("Phát hiện CSDL cũ, đang nâng cấp bảng 'accounts'...")
-                c.execute("ALTER TABLE accounts RENAME TO accounts_old")
-                c.execute('''
-                    CREATE TABLE IF NOT EXISTS accounts (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        web_name TEXT NOT NULL,
-                        api_key TEXT NOT NULL,
-                        api_url TEXT NOT NULL,
-                        threshold REAL NOT NULL,
-                        chat_id TEXT, 
-                        last_balance REAL,
-                        last_status TEXT,
-                        bot_id INTEGER REFERENCES telegram_bots(id) ON DELETE SET NULL
-                    )
-                ''')
-                c.execute("INSERT INTO accounts (id, web_name, api_key, api_url, threshold, chat_id, last_balance, last_status, bot_id) SELECT id, web_name, api_key, api_url, threshold, chat_id, last_balance, last_status, bot_id FROM accounts_old")
-                c.execute("DROP TABLE accounts_old")
-                print("Nâng cấp bảng 'accounts' thành công.")
-        except Exception as e:
-            if "no such column: bot_id" in str(e): 
-                 print("Phát hiện CSDL rất cũ, đang nâng cấp...")
-                 c.execute("ALTER TABLE accounts RENAME TO accounts_old_v2")
-                 init_db() 
-                 c.execute("INSERT INTO accounts (id, web_name, api_key, api_url, threshold, chat_id, last_balance, last_status) SELECT id, web_name, api_key, api_url, threshold, chat_id, last_balance, last_status FROM accounts_old_v2")
-                 c.execute("DROP TABLE accounts_old_v2")
-                 print("Nâng cấp CSDL rất cũ thành công.")
-            else:
-                 print(f"Lỗi khi kiểm tra nâng cấp CSDL: {e}")
+            if not has_bot_id:
+                 print("Phát hiện CSDL cũ, đang nâng cấp bảng 'accounts' (thêm bot_id)...")
+                 c.execute("ALTER TABLE accounts ADD COLUMN bot_id INTEGER REFERENCES telegram_bots(id) ON DELETE SET NULL")
+                 print("Nâng cấp bảng 'accounts' thành công.")
 
+        except Exception as e:
+            print(f"Lỗi khi kiểm tra nâng cấp CSDL: {e}")
 
         conn.commit()
         conn.close()
@@ -515,17 +553,35 @@ def check_balances():
 
 # --- Ứng dụng Web Flask ---
 
-# Trang chủ sẽ trả về 404
+# Trang Đăng Nhập
 @app.route('/')
-def root():
-    abort(404)
+def login_page():
+    if 'authenticated' in session:
+        return redirect(url_for('dashboard'))
+    return render_template_string(HTML_LOGIN)
 
-# Đây là route chính, bí mật của bạn
-@app.route(f'/<secret_path>/', methods=['GET'])
-def index(secret_path):
-    if secret_path != SECRET_PATH:
-        abort(404)
-        
+# Xử lý đăng nhập
+@app.route('/login', methods=['POST'])
+def login_handler():
+    secret_key = request.form.get('secret_key')
+    if secret_key == ADMIN_PASSWORD:
+        session['authenticated'] = True
+        return redirect(url_for('dashboard'))
+    else:
+        flash('Secret Key không chính xác!', 'error')
+        return redirect(url_for('login_page'))
+
+# Đăng xuất
+@app.route('/logout')
+def logout():
+    session.pop('authenticated', None)
+    flash('Bạn đã đăng xuất.', 'success')
+    return redirect(url_for('login_page'))
+
+# Trang chủ (Bảng điều khiển)
+@app.route('/dashboard')
+@login_required
+def dashboard():
     try:
         conn = sqlite3.connect(DATABASE_FILE)
         conn.row_factory = sqlite3.Row
@@ -547,17 +603,16 @@ def index(secret_path):
         all_bots = c.fetchall()
         
         conn.close()
-        return render_template_string(HTML_TEMPLATE, accounts=accounts, all_bots=all_bots, settings=settings, secret_path=SECRET_PATH)
+        return render_template_string(HTML_TEMPLATE, accounts=accounts, all_bots=all_bots, settings=settings)
     except Exception as e:
         flash(f"Lỗi khi tải dữ liệu: {e}", 'error')
-        return render_template_string(HTML_TEMPLATE, accounts=[], all_bots=[], settings={}, secret_path=SECRET_PATH)
+        return render_template_string(HTML_TEMPLATE, accounts=[], all_bots=[], settings={})
 
-# --- Các route chức năng (đã được cập nhật để chứa secret_path) ---
+# --- Các route chức năng ---
 
-@app.route(f'/<secret_path>/update_settings', methods=['POST'])
-def update_settings(secret_path):
-    if secret_path != SECRET_PATH:
-        abort(404)
+@app.route('/update_settings', methods=['POST'])
+@login_required
+def update_settings():
     try:
         default_chat_id = request.form['default_chat_id'].strip()
         default_bot_id = request.form['default_bot_id']
@@ -571,12 +626,11 @@ def update_settings(secret_path):
         flash('Lưu cài đặt chung thành công!', 'success')
     except Exception as e:
         flash(f"Lỗi khi lưu cài đặt: {e}", 'error')
-    return redirect(url_for('index', secret_path=SECRET_PATH))
+    return redirect(url_for('dashboard'))
 
-@app.route(f'/<secret_path>/add_bot', methods=['POST'])
-def add_bot(secret_path):
-    if secret_path != SECRET_PATH:
-        abort(404)
+@app.route('/add_bot', methods=['POST'])
+@login_required
+def add_bot():
     try:
         bot_name = request.form['bot_name']
         bot_token = request.form['bot_token']
@@ -590,12 +644,11 @@ def add_bot(secret_path):
         flash(f"Lỗi: Token này đã tồn tại.", 'error')
     except Exception as e:
         flash(f"Lỗi khi thêm bot: {e}", 'error')
-    return redirect(url_for('index', secret_path=SECRET_PATH))
+    return redirect(url_for('dashboard'))
 
-@app.route(f'/<secret_path>/delete_bot', methods=['POST'])
-def delete_bot(secret_path):
-    if secret_path != SECRET_PATH:
-        abort(404)
+@app.route('/delete_bot', methods=['POST'])
+@login_required
+def delete_bot():
     try:
         bot_id = int(request.form['id'])
         conn = sqlite3.connect(DATABASE_FILE)
@@ -607,12 +660,11 @@ def delete_bot(secret_path):
         flash('Xóa bot thành công!', 'success')
     except Exception as e:
         flash(f"Lỗi khi xóa bot: {e}", 'error')
-    return redirect(url_for('index', secret_path=SECRET_PATH))
+    return redirect(url_for('dashboard'))
 
-@app.route(f'/<secret_path>/test_bot', methods=['POST'])
-def test_bot(secret_path):
-    if secret_path != SECRET_PATH:
-        abort(404)
+@app.route('/test_bot', methods=['POST'])
+@login_required
+def test_bot():
     try:
         bot_id = int(request.form['bot_id'])
         bot_name = request.form['bot_name']
@@ -625,7 +677,7 @@ def test_bot(secret_path):
         bot_row = c.fetchone()
         if not bot_row:
             flash(f"Lỗi: Không tìm thấy bot '{bot_name}'.", 'error')
-            return redirect(url_for('index', secret_path=SECRET_PATH))
+            return redirect(url_for('dashboard'))
         bot_token = bot_row['bot_token']
         
         c.execute("SELECT setting_value FROM global_settings WHERE setting_key = 'default_chat_id'")
@@ -635,7 +687,7 @@ def test_bot(secret_path):
         if not default_chat_id:
             flash("Lỗi: Vui lòng nhập 'Chat ID Mặc Định' ở mục Cài Đặt Chung trước khi test.", 'error')
             conn.close()
-            return redirect(url_for('index', secret_path=SECRET_PATH))
+            return redirect(url_for('dashboard'))
 
         test_msg = f"✅ [THỬ NGHIỆM THÀNH CÔNG]\n\nBot '{bot_name}' đã kết nối thành công tới Chat ID này. Đang lấy báo cáo tổng quan..."
         is_success, error_msg = send_telegram_message(test_msg, default_chat_id, bot_token)
@@ -674,12 +726,11 @@ def test_bot(secret_path):
     finally:
         if 'conn' in locals() and conn:
             conn.close()
-    return redirect(url_for('index', secret_path=SECRET_PATH))
+    return redirect(url_for('dashboard'))
 
-@app.route(f'/<secret_path>/add', methods=['POST'])
-def add_account(secret_path):
-    if secret_path != SECRET_PATH:
-        abort(404)
+@app.route('/add', methods=['POST'])
+@login_required
+def add_account():
     try:
         web_name = request.form['web_name']
         api_key = request.form['api_key']
@@ -703,12 +754,11 @@ def add_account(secret_path):
         flash('Thêm tài khoản web thành công!', 'success')
     except Exception as e:
         flash(f"Lỗi khi thêm tài khoản: {e}", 'error')
-    return redirect(url_for('index', secret_path=SECRET_PATH))
+    return redirect(url_for('dashboard'))
 
-@app.route(f'/<secret_path>/delete', methods=['POST'])
-def delete_account(secret_path):
-    if secret_path != SECRET_PATH:
-        abort(404)
+@app.route('/delete', methods=['POST'])
+@login_required
+def delete_account():
     try:
         account_id = int(request.form['id'])
         conn = sqlite3.connect(DATABASE_FILE)
@@ -719,41 +769,128 @@ def delete_account(secret_path):
         flash('Xóa tài khoản web thành công!', 'success')
     except Exception as e:
         flash(f"Lỗi khi xóa tài khoản web: {e}", 'error')
-    return redirect(url_for('index', secret_path=SECRET_PATH))
+    return redirect(url_for('dashboard'))
 
-@app.route(f'/<secret_path>/export')
-def export_db(secret_path):
-    if secret_path != SECRET_PATH:
-        abort(404)
+# --- HÀM BACKUP/RESTORE JSON ---
+
+@app.route('/export_json')
+@login_required
+def export_json():
     try:
-        return send_file(DATABASE_FILE, as_attachment=True, download_name='accounts_backup.db')
-    except Exception as e:
-        flash(f"Lỗi khi tải file backup: {e}", 'error')
-        return redirect(url_for('index', secret_path=SECRET_PATH))
+        conn = sqlite3.connect(DATABASE_FILE)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
 
-@app.route(f'/<secret_path>/import', methods=['POST'])
-def import_db(secret_path):
-    if secret_path != SECRET_PATH:
-        abort(404)
+        c.execute("SELECT * FROM global_settings")
+        settings = [dict(row) for row in c.fetchall()]
+        
+        c.execute("SELECT * FROM telegram_bots")
+        bots = [dict(row) for row in c.fetchall()]
+        
+        c.execute("SELECT * FROM accounts")
+        accounts = [dict(row) for row in c.fetchall()]
+
+        conn.close()
+        
+        backup_data = {
+            "global_settings": settings,
+            "telegram_bots": bots,
+            "accounts": accounts
+        }
+        
+        # Tạo file JSON trong bộ nhớ
+        json_str = json.dumps(backup_data, indent=2, ensure_ascii=False)
+        json_bytes = io.BytesIO(json_str.encode('utf-8'))
+        
+        return send_file(
+            json_bytes,
+            as_attachment=True,
+            download_name='saldo_bot_backup.json',
+            mimetype='application/json'
+        )
+
+    except Exception as e:
+        flash(f"Lỗi khi xuất file JSON: {e}", 'error')
+        return redirect(url_for('dashboard'))
+
+@app.route('/import_json', methods=['POST'])
+@login_required
+def import_json():
     if 'backup_file' not in request.files:
         flash('Không có file nào được chọn.', 'error')
-        return redirect(url_for('index', secret_path=SECRET_PATH))
+        return redirect(url_for('dashboard'))
     file = request.files['backup_file']
     if file.filename == '':
         flash('Không có file nào được chọn.', 'error')
-        return redirect(url_for('index', secret_path=SECRET_PATH))
-    if file and file.filename.endswith('.db'):
+        return redirect(url_for('dashboard'))
+        
+    if file and file.filename.endswith('.json'):
         try:
+            # Đọc file JSON
+            data = json.load(io.TextIOWrapper(file.stream, encoding='utf-8'))
+            
+            # Tạm dừng bot
             scheduler.pause()
-            file.save(DATABASE_FILE)
-            flash('Restore CSDL thành công! Bot sẽ sử dụng dữ liệu mới.', 'success')
+            
+            conn = sqlite3.connect(DATABASE_FILE)
+            c = conn.cursor()
+
+            # Bắt đầu 1 transaction (quan trọng)
+            c.execute("BEGIN TRANSACTION")
+            try:
+                # 1. Xóa dữ liệu cũ
+                c.execute("DELETE FROM accounts")
+                c.execute("DELETE FROM telegram_bots")
+                c.execute("DELETE FROM global_settings")
+                
+                # 2. Khôi phục Bảng settings
+                if 'global_settings' in data:
+                    for setting in data['global_settings']:
+                        c.execute("INSERT INTO global_settings (setting_key, setting_value) VALUES (?, ?)",
+                                  (setting['setting_key'], setting['setting_value']))
+                
+                # 3. Khôi phục Bảng bots
+                if 'telegram_bots' in data:
+                    for bot in data['telegram_bots']:
+                        c.execute("INSERT INTO telegram_bots (id, bot_name, bot_token) VALUES (?, ?, ?)",
+                                  (bot.get('id'), bot['bot_name'], bot['bot_token']))
+                
+                # 4. Khôi phục Bảng accounts
+                if 'accounts' in data:
+                    for acc in data['accounts']:
+                        # Phải khớp với các cột trong CSDL
+                        c.execute("""
+                            INSERT INTO accounts (
+                                id, web_name, api_key, api_url, threshold, 
+                                chat_id, last_balance, last_status, bot_id
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            acc.get('id'), acc['web_name'], acc['api_key'], acc['api_url'], 
+                            acc['threshold'], acc.get('chat_id'), acc.get('last_balance'), 
+                            acc.get('last_status'), acc.get('bot_id')
+                        ))
+                
+                # Lưu transaction
+                conn.commit()
+                flash('Restore CSDL từ file JSON thành công!', 'success')
+                
+            except Exception as e:
+                conn.rollback() # Hoàn tác nếu có lỗi
+                flash(f"Lỗi khi ghi dữ liệu restore: {e}", 'error')
+            
+        except json.JSONDecodeError:
+            flash('Lỗi: File không phải là file JSON hợp lệ.', 'error')
         except Exception as e:
-            flash(f"Lỗi khi lưu file restore: {e}", 'error')
+            flash(f"Lỗi khi restore: {e}", 'error')
         finally:
+            if 'conn' in locals() and conn:
+                conn.close()
+            # Khởi động lại bot
             scheduler.resume()
     else:
-        flash('File không hợp lệ. Chỉ chấp nhận file .db', 'error')
-    return redirect(url_for('index', secret_path=SECRET_PATH))
+        flash('File không hợp lệ. Chỉ chấp nhận file .json', 'error')
+        
+    return redirect(url_for('dashboard'))
 
 # --- Chạy ứng dụng ---
 scheduler = BackgroundScheduler()
@@ -761,17 +898,20 @@ scheduler = BackgroundScheduler()
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 8080))
     
+    # Chạy init_db trong một thread riêng để không block
     db_init_thread = threading.Thread(target=init_db)
     db_init_thread.start()
-    db_init_thread.join()
+    db_init_thread.join() # Chờ cho CSDL sẵn sàng
     
+    # Lập lịch kiểm tra mỗi 2 phút
     scheduler.add_job(func=check_balances, trigger="interval", minutes=2)
     scheduler.start()
-    print(f"Trình lập lịch (Nâng cấp) đã bắt đầu, kiểm tra mỗi 2 PHÚT.")
+    print(f"Trình lập lịch đã bắt đầu, kiểm tra mỗi 2 PHÚT.")
     
     import atexit
     atexit.register(lambda: scheduler.shutdown())
 
     print(f"Khởi chạy web server tại http://0.0.0.0:{port}")
-    print(f"ĐƯỜNG DẪN TRUY CẬP BÍ MẬT: /{SECRET_PATH}/")
-    app.run(host='0.0.0.0', port=port)
+    print(f"Truy cập trang chủ để đăng nhập.")
+    # Gunicorn sẽ xử lý việc chạy app, không cần app.run()
+    # app.run(host='0.0.0.0', port=port) # Chỉ để test local
