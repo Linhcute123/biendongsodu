@@ -15,7 +15,7 @@ from flask import (
     url_for,
     session,
     flash,
-    send_file, # Thêm send_file cho chức năng backup
+    send_file,
 )
 from functools import wraps
 
@@ -48,13 +48,12 @@ watcher_started = False
 watcher_running = False
 
 # =========================
-# HELPERS: format tiền & thời gian
+# HELPERS: format tiền & thời gian & trích xuất số dư
 # =========================
 
 def fmt_amount(v: float) -> str:
     """1000000.0 -> 1,000,000đ"""
     try:
-        # Sử dụng f-string với định dạng comma cho số nguyên
         return f"{float(v):,.0f}đ"
     except Exception:
         return f"{v}đ"
@@ -68,7 +67,6 @@ def to_float(s: Optional[str], default: Optional[float] = None) -> Optional[floa
     try:
         if s is None:
             return default
-        # Xóa dấu phẩy và khoảng trắng
         s = str(s).replace(",", "").strip()
         return float(s)
     except Exception:
@@ -95,23 +93,14 @@ def _get_by_path(data: Any, path: str) -> Any:
 
 def extract_balance(json_data: Dict[str, Any], balance_field: str) -> Optional[float]:
     """Trích xuất số dư từ JSON, sử dụng balance_field hoặc tự động tìm."""
-    # 1. Nếu có balance_field cụ thể
     if balance_field:
         value = _get_by_path(json_data, balance_field)
         return to_float(value)
 
-    # 2. Tự động tìm (Thử các đường dẫn phổ biến)
     common_paths = [
-        "balance",
-        "data.balance",
-        "user.balance",
-        "profile.balance",
-        "result.balance",
-        "wallet.balance",
-        "amount",
-        "data.amount",
-        "data.money",
-        "money",
+        "balance", "data.balance", "user.balance", "profile.balance", 
+        "result.balance", "wallet.balance", "amount", "data.amount", 
+        "data.money", "money",
     ]
     for path in common_paths:
         value = _get_by_path(json_data, path)
@@ -125,6 +114,7 @@ def extract_balance(json_data: Dict[str, Any], balance_field: str) -> Optional[f
 # =========================
 # TEMPLATES (Giữ nguyên)
 # =========================
+
 LOGIN_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="vi">
@@ -179,7 +169,7 @@ LOGIN_TEMPLATE = r"""
                     <div class="px-3 py-2 rounded-2xl text-xs
                         {% if category == 'error' %}bg-red-900/60 text-red-200 border border-red-500/40
                         {% else %}bg-emerald-900/40 text-emerald-200 border border-emerald-500/30{% endif %}">
-                      {{ message }}
+                      {{ message | safe }}
                     </div>
                   {% endfor %}
                 </div>
@@ -338,7 +328,7 @@ DASHBOARD_TEMPLATE = r"""
 
                     <div>
                         <label class="block text-[10px] text-slate-400 mb-1">Chu kỳ quét (giây)</label>
-                        <input type="number" min="5" step="1" name="poll_interval"
+                        <input type="text" name="poll_interval"
                             value="{{ settings.poll_interval or '' }}"
                             placeholder="VD: 15, 30, 60..."
                             class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-400">
@@ -533,7 +523,7 @@ DASHBOARD_TEMPLATE = r"""
 """
 
 # =========================
-# DB HELPER (Hoàn thiện)
+# DB HELPER
 # =========================
 
 def init_db():
@@ -567,7 +557,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS apis (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
-            url TEXT NOT NULL UNIQUE, -- Đảm bảo URL là duy nhất
+            url TEXT NOT NULL UNIQUE,
             balance_field TEXT NOT NULL,
             last_balance REAL,
             last_change TEXT
@@ -667,7 +657,7 @@ def update_api_state(api_id: int, balance: float, changed_at: str):
 
 
 # =========================
-# TELEGRAM NOTIFIER (Hoàn thiện)
+# TELEGRAM NOTIFIER
 # =========================
 
 def send_telegram_message(token: str, chat_id: str, message: str) -> bool:
@@ -696,12 +686,10 @@ def notify_change(api: Dict[str, Any], new_balance: float, settings: Dict[str, O
     old_balance = api.get('last_balance', 0.0) or 0.0
     change = new_balance - old_balance
     
-    # Lấy ngưỡng cảnh báo
     global_threshold = to_float(settings.get('global_threshold')) or 0.0
     
-    # Kiểm tra điều kiện cảnh báo
     if abs(change) < global_threshold:
-        return # Không đủ lớn để cảnh báo
+        return
 
     if not settings.get('default_chat_id') or not bots:
         print("Bỏ qua cảnh báo: Thiếu Chat ID hoặc Bot Token.")
@@ -730,14 +718,12 @@ def notify_change(api: Dict[str, Any], new_balance: float, settings: Dict[str, O
 <b>Thời gian (UTC):</b> {fmt_time_label_utc(datetime.utcnow())}
 """
     
-    # Lấy Bot để gửi
     bots_to_send = []
     if settings.get('default_bot_id'):
         default_bot = next((b for b in bots if b['id'] == int(settings['default_bot_id'])), None)
         if default_bot:
             bots_to_send.append(default_bot)
         else:
-            print("Cảnh báo: Bot mặc định không tồn tại, sẽ gửi bằng TẤT CẢ bot.")
             bots_to_send = bots
     else:
         bots_to_send = bots
@@ -748,7 +734,7 @@ def notify_change(api: Dict[str, Any], new_balance: float, settings: Dict[str, O
             print(f"Lỗi gửi cảnh báo bằng bot: {bot['bot_name']}")
 
 # =========================
-# WATCHER CORE LOGIC (Hoàn thiện)
+# WATCHER CORE LOGIC
 # =========================
 
 def check_balances():
@@ -764,7 +750,6 @@ def check_balances():
     print(f"[{run_time}] Bắt đầu chu kỳ quét ({len(apis)} API) - Threshold: {global_threshold_val}đ")
 
     for api in apis:
-        # print(f"Đang kiểm tra: {api['name']}...")
         try:
             # 1. Gọi API
             response = requests.get(api['url'], timeout=15)
@@ -775,10 +760,8 @@ def check_balances():
             new_balance = extract_balance(json_data, api['balance_field'])
 
             if new_balance is None:
-                # print(f"⚠️ API {api['name']}: Không trích xuất được số dư. Response: {json.dumps(json_data)}")
                 continue
             
-            # Đảm bảo là float
             new_balance = float(new_balance)
             
             # 3. So sánh và Cảnh báo
@@ -786,8 +769,7 @@ def check_balances():
             
             if old_balance is not None:
                 old_balance = float(old_balance)
-                if abs(new_balance - old_balance) > 0.01: # Chênh lệch nhỏ hơn 1 xu thì bỏ qua
-                    # Cảnh báo chỉ khi thay đổi > global_threshold
+                if abs(new_balance - old_balance) > 0.01:
                     notify_change(api, new_balance, settings, bots)
             
             # 4. Cập nhật DB
@@ -811,14 +793,12 @@ def watcher_thread():
     
     while watcher_running:
         settings = get_settings()
-        # Lấy chu kỳ quét, nếu không có/không hợp lệ thì dùng mặc định
         poll_interval = to_float(settings.get('poll_interval'))
         if not poll_interval or poll_interval < 5:
             poll_interval = POLL_INTERVAL_DEFAULT
             
         check_balances()
         
-        # Chờ trước khi chạy lần tiếp theo
         print(f"Tạm dừng {int(poll_interval)} giây...")
         time.sleep(poll_interval)
     
@@ -829,14 +809,13 @@ def start_watcher():
     """Bắt đầu luồng watcher nếu chưa chạy."""
     global watcher_started
     if not watcher_started:
-        print("Bắt đầu Watcher Thread...")
         thread = threading.Thread(target=watcher_thread)
         thread.daemon = True
         thread.start()
         watcher_started = True
 
 # =========================
-# FLASK ROUTES (Hoàn thiện)
+# FLASK ROUTES
 # =========================
 
 def login_required(f):
@@ -860,8 +839,9 @@ def login():
         if password == ADMIN_PASSWORD:
             session["logged_in"] = True
             flash("Đăng nhập thành công! Chào mừng trở lại vũ trụ.", "success")
-            # Khởi động watcher ngay sau khi đăng nhập thành công
-            start_watcher()
+            # Chỉ khởi động watcher ở đây nếu đang ở môi trường phát triển (debug)
+            if os.environ.get("FLASK_ENV") == "development":
+                start_watcher()
             return redirect(url_for("dashboard"))
         else:
             flash("Mật khẩu quản trị không chính xác.", "error")
@@ -884,11 +864,9 @@ def dashboard():
     bots = get_bots()
     apis = get_apis()
 
-    # Lấy chu kỳ quét hiện tại
     poll_interval_db = to_float(settings.get('poll_interval'))
     effective_poll_interval = int(poll_interval_db) if poll_interval_db and poll_interval_db >= 5 else POLL_INTERVAL_DEFAULT
     
-    # Lấy ngưỡng cảnh báo chung
     global_threshold_val = to_float(settings.get('global_threshold'))
 
     return render_template_string(
@@ -918,9 +896,8 @@ def save_settings():
             if interval_sec is None or interval_sec < 5:
                  flash("Chu kỳ quét tối thiểu là **5 giây** và phải là số hợp lệ.", "error")
                  return redirect(url_for("dashboard"))
-            poll_interval = str(int(interval_sec)) # Lưu dưới dạng số nguyên string
+            poll_interval = str(int(interval_sec))
         
-        # Xóa dấu phẩy trong ngưỡng cảnh báo
         if global_threshold:
             global_threshold = global_threshold.replace(",", "")
             if to_float(global_threshold) is None:
@@ -1054,14 +1031,11 @@ def delete_api(api_id: int):
 @login_required
 def download_backup():
     """Tải xuống file backup DB (chỉ hỗ trợ file sqlite3)."""
-    from flask import send_file
     try:
-        # Đảm bảo file tồn tại
         if not os.path.exists(DB_PATH):
              flash("Lỗi: File cơ sở dữ liệu không tồn tại.", "error")
              return redirect(url_for("dashboard"))
              
-        # Tải xuống file sqlite3
         return send_file(DB_PATH, as_attachment=True, download_name="balance_watcher_backup.db")
     except Exception as e:
         flash(f"Lỗi khi tạo file backup: {e}", "error")
@@ -1069,19 +1043,23 @@ def download_backup():
 
 
 # =========================
-# KHỞI TẠO VÀ CHẠY
+# KHỞI TẠO VÀ CHẠY (PHẦN ĐÃ SỬA LỖI)
 # =========================
 
-if __name__ == "__main__":
-    init_db()
-    
-    # Khởi động watcher ngay khi ứng dụng bắt đầu nếu không phải môi trường dev
-    if os.environ.get("FLASK_ENV") != "development":
-        start_watcher()
-    else:
-        # Nếu đang debug, khởi động watcher sau khi login thành công (xem route login)
-        pass 
+# SỬA LỖI: Luôn gọi init_db() để đảm bảo các bảng tồn tại ngay cả khi 
+# Gunicorn/WSGI server đang tải ứng dụng.
+init_db() 
 
-    print("Khởi động ứng dụng Flask...")
-    # Chạy trên host '0.0.0.0' để tương thích với các nền tảng hosting (như Render)
+# Logic khởi động Watcher Thread
+if os.environ.get("FLASK_ENV") != "development":
+    # Khởi động watcher ngay cho môi trường production (như Render)
+    start_watcher()
+    print("Watcher Thread được tự động khởi động (Production mode).")
+else:
+    # Trong môi trường dev, watcher sẽ được khởi động sau khi login thành công.
+    print("Watcher Thread sẽ được khởi động khi Admin đăng nhập lần đầu (Development mode).")
+
+
+if __name__ == "__main__":
+    print("Khởi động ứng dụng Flask (Dev Server)...")
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)), debug=os.environ.get("FLASK_ENV") == "development")
