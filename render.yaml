@@ -2,14 +2,6 @@ services:
   - type: web
     name: biendongsodu
     env: python
-    branch: main  # Branch chính
-    buildCommand: pip install -r requirements.txt
-    startCommand: python app.py  # Giả sử file Python chính là app.py
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.12.3  # Phiên bản Python phù hợp
-      - key: FLASK_SECRET_KEY
-        sync: false  # Set giá trị bí mật trên Render dashboard
-      # Thêm env vars khác nếu cần, như database nếu dùng external DB (nhưng code dùng SQLite local)
-    plan: free  # Hoặc starter nếu cần tài nguyên lớn hơn
-    autoDeploy: true  # Tự deploy khi push code
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn app:app"
