@@ -282,7 +282,7 @@ HTML_TEMPLATE = """
                         <div>
                             <h3 class="text-lg font-medium text-gray-300 mb-2">Restore từ Backup (Import)</h3>
                             <form action="{{ url_for('import_json') }}" method="POST" enctype="multipart/form-data" 
-                                  onsubmit="return confirm('BẠN CÓ CHẮC CHẮN MUỐN GHI ĐÈ TOÀN BỘ DỮ LIỆN HIỆN TẠI BẰNG FILE NÀY KHÔNG?');">
+                                  onsubmit="return confirm('BẠN CÓ CHẮC CHẮN MUỐN GHI ĐÈ TOÀN BỘ DỮ LIỆU HIỆN TẠI BẰNG FILE NÀY KHÔNG?');">
                                 <input type="file" name="backup_file" accept=".json" required class="block w-full text-sm text-gray-400
                                   file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-semibold
                                   file:bg-gray-700 file:text-cyan-400 hover:file:bg-gray-600 mb-2 transition-colors"/>
@@ -333,11 +333,14 @@ HTML_TEMPLATE = """
                                     </td>
                                     <td class="px-5 py-4 whitespace-nowrap text-sm text-gray-400">{{ "{:,.0f}đ".format(acc.threshold) }}</td>
                                     <td class="px-5 py-4 whitespace-nowrap text-sm text-gray-300 font-semibold">{{ "{:,.0f}đ".format(acc.last_balance) if acc.last_balance is not None else 'N/A' }}</td>
+                                    
                                     <td class="px-5 py-4 whitespace-nowrap text-sm">
                                         {% if acc.last_status == 'OK' %}
                                             <span class="px-3 py-1 inline-flex text-xs leading-5 font-semibold rounded-full bg-green-900 text-green-300">OK</span>
-                                        {% elif acc.last_status is not None and acc.last_status != 'OK' %}
+                                        
+                                        {% elif acc.last_status is not none and acc.last_status != 'OK' %}
                                             <span class="px-3 py-1 inline-flex text-xs leading-5 font-semibold rounded-full bg-red-900 text-red-300" title="{{ acc.last_status }}">Lỗi</span>
+                                        
                                         {% else %}
                                             <span class="px-3 py-1 inline-flex text-xs leading-5 font-semibold rounded-full bg-gray-700 text-gray-400">Chưa rõ</span>
                                         {% endif %}
