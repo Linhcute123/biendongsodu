@@ -3,8 +3,9 @@ import sqlite3
 import threading
 import time
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
+import io
 
 import requests
 from flask import (
@@ -25,19 +26,14 @@ from functools import wraps
 
 APP_TITLE = "Balance Watcher Universe"
 
-# Một pass duy nhất:
-# - ADMIN_PASSWORD: dùng để login
-# - SECRET_KEY: nếu không set riêng thì dùng luôn ADMIN_PASSWORD
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "changeme")
 SECRET_KEY = os.getenv("SECRET_KEY", ADMIN_PASSWORD)
 
-# DB path (Render dùng /data cho persistent)
 DATA_DIR = "/data"
 if not os.path.isdir(DATA_DIR):
     DATA_DIR = "."
 DB_PATH = os.path.join(DATA_DIR, "balance_watcher.db")
 
-# Mặc định nếu người dùng chưa nhập trong giao diện
 POLL_INTERVAL_DEFAULT = 30  # giây
 
 app = Flask(__name__)
@@ -51,16 +47,22 @@ watcher_running = False
 # HELPERS: format tiền & thời gian & trích xuất số dư
 # =========================
 
+VN_TIMEZONE_OFFSET = timedelta(hours=7)
+
+def get_current_vn_time() -> datetime:
+    """Lấy thời gian hiện tại theo Giờ Việt Nam (UTC+7)."""
+    return datetime.utcnow() + VN_TIMEZONE_OFFSET
+
+def fmt_time_label_vn(dt: datetime) -> str:
+    """20:40 10/11/2025 (VN)"""
+    return dt.strftime("%H:%M %d/%m/%Y (VN)")
+
 def fmt_amount(v: float) -> str:
     """1000000.0 -> 1,000,000đ"""
     try:
         return f"{float(v):,.0f}đ"
     except Exception:
         return f"{v}đ"
-
-def fmt_time_label_utc(dt: datetime) -> str:
-    """20:40 10/11/2025 (UTC)"""
-    return dt.strftime("%H:%M %d/%m/%Y (UTC)")
 
 def to_float(s: Optional[str], default: Optional[float] = None) -> Optional[float]:
     """Chuyển đổi string (có thể có dấu phẩy) sang float."""
@@ -112,7 +114,7 @@ def extract_balance(json_data: Dict[str, Any], balance_field: str) -> Optional[f
     return None
 
 # =========================
-# TEMPLATES (Đã cập nhật phần Backup & Restore)
+# TEMPLATES (Giữ nguyên)
 # =========================
 
 LOGIN_TEMPLATE = r"""
@@ -580,12 +582,11 @@ def init_db():
         conn.close()
 
 def get_settings() -> Dict[str, Optional[str]]:
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT key, value FROM settings")
-        rows = c.fetchall()
-        conn.close()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT key, value FROM settings")
+    rows = c.fetchall()
+    conn.close()
     return {k: (v if v is not None else "") for k, v in rows}
 
 def set_setting(key: str, value: str):
@@ -656,18 +657,18 @@ def delete_api_db(api_id: int):
         conn.commit()
         conn.close()
 
-def update_api_state(api_id: int, balance: float, changed_at: str):
-    """Lưu số dư dưới dạng INTEGER (số nguyên) để tránh lỗi dấu phẩy động."""
+def update_api_state(api_id: int, balance: float):
+    """Lưu số dư dưới dạng INTEGER và thời gian theo giờ VN."""
     with db_lock:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         
-        # Chuyển số dư float sang integer (bỏ phần thập phân) trước khi lưu
         int_balance = int(balance) 
+        vn_time_str = fmt_time_label_vn(get_current_vn_time())
         
         c.execute(
             "UPDATE apis SET last_balance=?, last_change=? WHERE id=?",
-            (int_balance, changed_at, api_id),
+            (int_balance, vn_time_str, api_id),
         )
         conn.commit()
         conn.close()
@@ -678,12 +679,10 @@ def clear_all_data():
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         
-        # Xóa dữ liệu cũ
         c.execute("DELETE FROM apis")
         c.execute("DELETE FROM telegram_bots")
-        c.execute("DELETE FROM settings WHERE key NOT IN ('admin_password_hash', 'secret_key')") # Giữ lại key quan trọng nếu có
+        c.execute("DELETE FROM settings WHERE key NOT IN ('admin_password_hash', 'secret_key')") 
         
-        # Reset lại các settings mặc định
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('default_chat_id', '')")
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('default_bot_id', '')")
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('last_run', '')")
@@ -721,9 +720,12 @@ def send_telegram_message(token: str, chat_id: str, message: str) -> bool:
 def notify_change(api: Dict[str, Any], change: int, new_balance: float, settings: Dict[str, Optional[str]], bots: List[Dict[str, Any]]):
     """Gửi thông báo khi số dư thay đổi đáng kể."""
     
-    global_threshold = to_float(settings.get('global_threshold')) or 0.0
+    global_threshold_float = to_float(settings.get('global_threshold')) or 0.0
     
-    if abs(change) < global_threshold:
+    # 💡 SỬA LỖI NGƯỠNG: Ép ngưỡng về INT để so sánh nhất quán với 'change'
+    global_threshold_int = int(global_threshold_float)
+    
+    if abs(change) < global_threshold_int:
         return
 
     if not settings.get('default_chat_id') or not bots:
@@ -741,8 +743,8 @@ def notify_change(api: Dict[str, Any], change: int, new_balance: float, settings
         change_color = "🔴"
         emoji = "⚠️"
 
-    # Lấy old_balance bằng cách trừ change (số nguyên) khỏi new_balance (số float)
     old_balance_float = new_balance - change
+    vn_time_str = fmt_time_label_vn(get_current_vn_time())
 
     message = f"""{emoji} <b>BALANCE WATCHER ALERT</b> {emoji}
 ---
@@ -753,7 +755,7 @@ def notify_change(api: Dict[str, Any], change: int, new_balance: float, settings
 <b>Số dư cũ:</b> {fmt_amount(old_balance_float)}
 <b>Số dư mới:</b> {fmt_amount(new_balance)}
 
-<b>Thời gian (UTC):</b> {fmt_time_label_utc(datetime.utcnow())}
+<b>Thời gian (VN):</b> {vn_time_str}
 """
     
     bots_to_send = []
@@ -781,7 +783,8 @@ def check_balances():
     apis = get_apis()
     bots = get_bots()
     
-    run_time = datetime.utcnow().strftime("%H:%M:%S %d/%m")
+    vn_time = get_current_vn_time()
+    run_time = vn_time.strftime("%H:%M:%S %d/%m")
     set_setting('last_run', run_time)
     
     global_threshold_val = settings.get('global_threshold') or '0'
@@ -803,21 +806,19 @@ def check_balances():
             new_balance = float(new_balance)
             
             # 3. So sánh và Cảnh báo
-            old_balance_int = api.get('last_balance') # Lấy INTEGER từ DB
+            old_balance_int = api.get('last_balance')
             
             if old_balance_int is not None:
-                # Ép new_balance về INT để so sánh, loại bỏ sai số thập phân
                 new_balance_int = int(new_balance) 
                 
                 change = new_balance_int - old_balance_int
                 
                 if abs(change) > 0:
                     print(f"💰 Phát hiện thay đổi trên {api['name']} ({api['last_balance']} -> {new_balance_int})")
-                    # Dùng change (INT) và new_balance (FLOAT) để gửi thông báo
                     notify_change(api, change, new_balance, settings, bots)
             
-            # 4. Cập nhật DB (Dùng giá trị float mới nhất)
-            update_api_state(api['id'], new_balance, fmt_time_label_utc(datetime.utcnow()))
+            # 4. Cập nhật DB
+            update_api_state(api['id'], new_balance) 
 
         except requests.exceptions.RequestException as e:
             print(f"❌ Lỗi HTTP/Network khi quét {api['name']}: {e}")
@@ -1076,13 +1077,12 @@ def download_backup():
     """Tải xuống file backup ở dạng JSON."""
     
     backup_data = {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": get_current_vn_time().isoformat(),
         "settings": get_settings(),
         "telegram_bots": get_bots(),
         "apis": get_apis(),
     }
     
-    # Chuẩn bị phản hồi với file JSON
     response = app.response_class(
         response=json.dumps(backup_data, indent=4),
         status=200,
@@ -1110,37 +1110,37 @@ def upload_restore():
         return redirect(url_for("dashboard"))
 
     try:
-        # Đọc nội dung file
-        data = json.load(file.stream)
+        data = json.load(io.TextIOWrapper(file.stream, encoding='utf-8'))
         
-        # 1. Xác thực cấu trúc cơ bản
         if not all(k in data for k in ["settings", "telegram_bots", "apis"]):
             flash("Cấu trúc file JSON không hợp lệ. Thiếu trường 'settings', 'telegram_bots' hoặc 'apis'.", "error")
             return redirect(url_for("dashboard"))
             
-        # 2. Xóa dữ liệu cũ và reset settings
         clear_all_data()
         
-        # 3. Khôi phục Settings
-        for key, value in data["settings"].items():
-            if key not in ['admin_password_hash', 'secret_key']: # Không ghi đè các key bảo mật
-                set_setting(key, value)
-                
-        # 4. Khôi phục Bots
-        for bot in data["telegram_bots"]:
-            try:
-                add_bot_db(bot['bot_name'], bot['bot_token'])
-            except sqlite3.IntegrityError:
-                pass # Bỏ qua bot trùng token
-
-        # 5. Khôi phục APIs
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        for api in data["apis"]:
+        
+        for key, value in data["settings"].items():
+            if key not in ['admin_password_hash', 'secret_key']:
+                set_setting(key, value)
+                
+        for bot in data["telegram_bots"]:
             try:
                 c.execute(
+                    "INSERT INTO telegram_bots (bot_name, bot_token) VALUES (?, ?)",
+                    (bot['bot_name'], bot['bot_token']),
+                )
+            except sqlite3.IntegrityError:
+                 flash(f"⚠️ Cảnh báo: Bot '{bot['bot_name']}' bị trùng Token và đã bị bỏ qua.", "error")
+        
+        for api in data["apis"]:
+            try:
+                last_balance_int = int(float(api.get('last_balance'))) if api.get('last_balance') is not None else None
+
+                c.execute(
                     "INSERT INTO apis (name, url, balance_field, last_balance, last_change) VALUES (?, ?, ?, ?, ?)",
-                    (api['name'], api['url'], api['balance_field'], api.get('last_balance'), api.get('last_change')),
+                    (api['name'], api['url'], api['balance_field'], last_balance_int, api.get('last_change')),
                 )
             except sqlite3.IntegrityError:
                  flash(f"⚠️ Cảnh báo: API '{api['name']}' bị trùng URL và đã bị bỏ qua.", "error")
