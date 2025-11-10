@@ -1,17 +1,25 @@
 services:
   - type: web
-    name: biendongsodu
-    env: python
+    name: saldo-bot
+    runtime: python        # hoặc env: python (runtime là chuẩn mới)
     region: singapore
     plan: free
+
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python app.py"
-    disks:  # Đây là phần sửa, disks phải nằm trong service
-      - name: data
-        mountPath: /data
-        sizeGB: 1
-    envVars:  # envVars cũng phải nằm trong service
-      - key: PYTHON_VERSION
-        value: 3.10
+
+    # Biến môi trường app.py đang dùng
+    envVars:
+      - key: SECRET_PATH
+        generateValue: true          # Render tự sinh, log ra trong deploy log
       - key: admin
-        fromAdmin: true
+        generateValue: true
+      # Nếu muốn thêm cờ admin thì:
+      # - key: admin
+      #   value: "true"
+
+    # Persistent disk cho /data
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
