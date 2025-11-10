@@ -1,941 +1,878 @@
 import os
-import sqlite3
-import requests
-import threading
-import sys
 import json
-import io
-import functools 
+import threading
+import time
+from datetime import datetime
+from typing import Any, Dict, List
 
+import requests
 from flask import (
-    Flask, render_template_string, request, redirect, url_for, 
-    session, flash, send_file, abort, Response, jsonify
+    Flask,
+    request,
+    redirect,
+    url_for,
+    session,
+    Response,
+    render_template_string,
+    flash,
 )
-from apscheduler.schedulers.background import BackgroundScheduler
-from urllib.parse import urlparse
-from werkzeug.utils import secure_filename
 
-# --- Cấu hình ---
-# 1. KEY BÍ MẬT VÀ SECRET KEY
-ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD')
-if not ADMIN_PASSWORD:
-    print("CẢNH BÁO: ADMIN_PASSWORD chưa được đặt. Đặt thành 'admin' cho mục đích test.", file=sys.stderr)
-    ADMIN_PASSWORD = 'admin'
+from jinja2 import DictLoader, ChoiceLoader
 
-FLASK_SECRET_KEY = os.environ.get('FLASK_SECRET_KEY', ADMIN_PASSWORD) 
-# ADMIN_PASSWORD chỉ dùng cho logic đăng nhập. FLASK_SECRET_KEY dùng cho session.
+# ----------------------
+# Basic Config
+# ----------------------
+APP_TITLE = "Balance Watcher Universe"
+CONFIG_PATH = os.getenv("CONFIG_PATH", "config.json")
+STATE_PATH = os.getenv("STATE_PATH", "state.json")
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))  # giây giữa mỗi lần quét
 
-app = Flask(__name__)
-app.secret_key = FLASK_SECRET_KEY # Dùng key riêng cho Flask
+# ĐẶT TRÊN RENDER: ADMIN_PASSWORD & SECRET_KEY
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "changeme")  # BẮT BUỘC đổi trên Render
+SECRET_KEY = os.getenv("SECRET_KEY", "super-secret-key-change-me")
 
-# --- Cấu hình CSDL (Render Persistent Disk) ---
-# Sử dụng thư mục /data là Mount Path của Persistent Disk trong render.yaml
-DATA_DIR = os.environ.get('RENDER_DISK_PATH', 'data')
-if not os.path.exists(DATA_DIR):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    
-DATABASE_FILE = os.path.join(DATA_DIR, 'accounts.db')
-print(f"Sử dụng CSDL tại: {DATABASE_FILE}")
+lock = threading.Lock()
 
-
-# --- Decorator: Yêu cầu đăng nhập ---
-def login_required(f):
-    @functools.wraps(f)
-    def decorated_function(*args, **kwargs):
-        if 'authenticated' not in session:
-            flash('Bạn phải đăng nhập để xem trang này.', 'error')
-            return redirect(url_for('login_page'))
-        return f(*args, **kwargs)
-    return decorated_function
-
-# --- Giao diện Web (HTML) ---
-
-# Giao diện Đăng Nhập (Bản hoàn thiện)
-HTML_LOGIN = """
+# ----------------------
+# Template nền vũ trụ + bản quyền Admin Văn Linh
+# ----------------------
+BASE_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="vi">
 <head>
     <meta charset="UTF-8">
+    <title>{{ title or "Balance Watcher Universe" }}</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Đăng Nhập - Bot của Admin Văn Linh</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
-        body { 
-            font-family: 'Inter', sans-serif;
-            background-color: #0B1120;
-            background-image: radial-gradient(circle at 1px 1px, rgba(200, 200, 255, 0.1) 1px, transparent 0);
-            background-size: 20px 20px;
+        :root {
+            --bg-main: #030018;
+            --bg-card: rgba(10, 8, 30, 0.98);
+            --bg-input: rgba(15, 15, 40, 0.98);
+            --accent: #5b8dff;
+            --accent2: #ff5bf1;
+            --text-main: #f6f6ff;
+            --text-soft: #9aa0c6;
+            --danger: #ff4d6a;
+            --success: #2ecc71;
+            --radius-xl: 22px;
+            --shadow-soft: 0 18px 60px rgba(0, 0, 0, 0.55);
+            --border-soft: 1px solid rgba(255,255,255,0.06);
+            --font-main: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", -system-ui, sans-serif;
         }
-        /* Style cho vòng tròn tích xanh chuyên nghiệp */
-        .verified-badge {
-            display: inline-flex;
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: var(--font-main);
+            background: radial-gradient(circle at top, #15163b 0, #030018 40%, #000 100%);
+            color: var(--text-main);
+            min-height: 100vh;
+            display: flex;
+            align-items: stretch;
+            justify-content: center;
+        }
+        .stars {
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            background-image:
+                radial-gradient(circle at 10% 20%, rgba(255,255,255,0.11) 0, transparent 40%),
+                radial-gradient(circle at 90% 10%, rgba(91,141,255,0.18) 0, transparent 55%),
+                radial-gradient(circle at 0% 80%, rgba(255,91,241,0.12) 0, transparent 55%);
+            opacity: 0.36;
+            mix-blend-mode: screen;
+            z-index: 0;
+        }
+        .wrapper {
+            position: relative;
+            z-index: 2;
+            width: 100%;
+            max-width: 1180px;
+            padding: 32px 18px 32px;
+            display: flex;
             align-items: center;
             justify-content: center;
-            flex-shrink: 0;
-            width: 20px;
-            height: 20px;
-            border-radius: 50%;
-            background-color: #3b82f6; 
-            color: white;
-            font-weight: bold;
+        }
+        .card {
+            width: 100%;
+            background: linear-gradient(135deg, rgba(255,255,255,0.02), rgba(91,141,255,0.04)) border-box,
+                        var(--bg-card) padding-box;
+            border-radius: 28px;
+            padding: 26px 26px 22px;
+            box-shadow: var(--shadow-soft);
+            border: 1px solid rgba(255,255,255,0.09);
+            backdrop-filter: blur(24px);
+        }
+        .logo-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 3px;
+        }
+        .orb {
+            width: 26px;
+            height: 26px;
+            border-radius: 999px;
+            background: conic-gradient(from 160deg, #5b8dff, #ff5bf1, #5bffde, #5b8dff);
+            box-shadow: 0 0 16px rgba(91,141,255,0.9);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 15px;
+            color: #fff;
+        }
+        .brand-title {
+            font-size: 17px;
+            font-weight: 500;
+            color: var(--text-soft);
+        }
+        .brand-sub {
             font-size: 12px;
-            margin-left: 6px;
-            vertical-align: middle;
+            color: var(--text-soft);
+            opacity: 0.9;
+        }
+        .main-title {
+            margin: 6px 0 12px;
+            font-size: 27px;
+            font-weight: 650;
+            letter-spacing: 0.01em;
+            display: flex;
+            align-items: baseline;
+            gap: 8px;
+        }
+        .main-title span.accent {
+            font-size: 15px;
+            color: var(--accent2);
+            font-weight: 400;
+        }
+        .badge-linh {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px 4px 6px;
+            border-radius: 999px;
+            background: radial-gradient(circle at 0 0, rgba(91,141,255,0.35), transparent);
+            border: 1px solid rgba(91,141,255,0.5);
+            font-size: 10px;
+            color: var(--text-soft);
+        }
+        .badge-linh .check {
+            width: 16px;
+            height: 16px;
+            border-radius: 999px;
+            background: radial-gradient(circle at 30% 30%, #fff, #1da1f2);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 11px;
+            color: #fff;
+            box-shadow: 0 0 8px rgba(29,161,242,0.9);
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: 1.7fr 1.4fr;
+            gap: 18px;
+            margin-top: 4px;
+        }
+        .panel {
+            background: radial-gradient(circle at top left, rgba(91,141,255,0.18), transparent),
+                        var(--bg-input);
+            border-radius: var(--radius-xl);
+            padding: 14px 14px 12px;
+            border: var(--border-soft);
+            box-shadow: 0 12px 36px rgba(0,0,0,0.55);
+        }
+        .panel-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+        .panel-title {
+            font-size: 13px;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.14em;
+            color: var(--text-soft);
+        }
+        .chip {
+            padding: 3px 8px;
+            border-radius: 999px;
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.05);
+            font-size: 10px;
+            color: var(--accent);
+        }
+        label {
+            display: block;
+            font-size: 11px;
+            margin-bottom: 2px;
+            color: var(--text-soft);
+        }
+        input[type="text"],
+        input[type="password"],
+        textarea {
+            width: 100%;
+            padding: 7px 9px;
+            border-radius: 11px;
+            border: 1px solid rgba(255,255,255,0.09);
+            background: rgba(5,5,20,0.98);
+            color: var(--text-main);
+            font-size: 11px;
+            outline: none;
+            transition: all 0.16s ease;
+        }
+        input::placeholder,
+        textarea::placeholder {
+            color: rgba(154,160,198,0.5);
+        }
+        input:focus,
+        textarea:focus {
+            border-color: var(--accent2);
+            box-shadow: 0 0 12px rgba(91,141,255,0.24);
+        }
+        textarea {
+            min-height: 54px;
+            resize: vertical;
+        }
+        .btn-row {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-top: 8px;
+        }
+        .btn {
+            border: none;
+            border-radius: 999px;
+            padding: 7px 12px;
+            font-size: 10px;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background: linear-gradient(135deg, var(--accent), var(--accent2));
+            color: #ffffff;
+            box-shadow: 0 8px 22px rgba(0,0,0,0.65);
+            transition: all 0.16s ease;
+        }
+        .btn span { font-size: 11px; }
+        .btn-soft {
+            background: rgba(255,255,255,0.02);
+            color: var(--text-soft);
+            border: 1px solid rgba(255,255,255,0.1);
+            box-shadow: none;
+        }
+        .btn-danger { background: var(--danger); }
+        .btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 10px 26px rgba(0,0,0,0.8);
+        }
+        .btn-soft:hover {
+            box-shadow: 0 10px 26px rgba(0,0,0,0.55);
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 6px;
+            font-size: 10px;
+        }
+        th, td {
+            padding: 4px 5px;
+            border-bottom: 1px solid rgba(255,255,255,0.04);
+            color: var(--text-soft);
+            text-align: left;
+        }
+        th {
+            font-size: 9px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: rgba(154,160,198,0.95);
+        }
+        tr:last-child td { border-bottom: none; }
+        .pill {
+            padding: 2px 7px;
+            border-radius: 999px;
+            font-size: 9px;
+        }
+        .pill-ok {
+            background: rgba(46,204,113,0.16);
+            color: var(--success);
+        }
+        .pill-unknown {
+            background: rgba(255,255,255,0.02);
+            color: var(--text-soft);
+        }
+        .pill-id {
+            background: rgba(91,141,255,0.18);
+            color: var(--accent);
+        }
+        .footer {
+            margin-top: 10px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 8px;
+            font-size: 9px;
+            color: var(--text-soft);
+        }
+        .logout-link {
+            color: rgba(154,160,198,0.8);
+            text-decoration: none;
+            font-size: 9px;
+        }
+        .logout-link:hover { color: var(--accent2); }
+        .flash {
+            padding: 6px 9px;
+            border-radius: 13px;
+            font-size: 9px;
+            margin-bottom: 6px;
+            background: rgba(255,255,255,0.02);
+            border: 1px solid rgba(255,255,255,0.09);
+            color: var(--accent);
+        }
+        .flash-error {
+            border-color: var(--danger);
+            color: var(--danger);
+        }
+        @media (max-width: 840px) {
+            .grid { grid-template-columns: 1fr; }
+            .card { padding: 20px 16px 16px; }
         }
     </style>
 </head>
-<body class="text-gray-200 min-h-screen flex items-center justify-center p-4">
-    <div class="max-w-md w-full bg-gray-800/70 backdrop-blur-sm rounded-lg shadow-2xl p-8 border border-gray-700">
-        
-        <h2 class="text-2xl font-bold text-center mb-6">
-            <span class="bg-clip-text text-transparent bg-gradient-to-r from-purple-400 to-cyan-400">
-                Bot được Build và phát triển bởi Admin Văn Linh
-            </span>
-            <span class="verified-badge">✓</span>
-        </h2>
-        
+<body>
+<div class="stars"></div>
+<div class="wrapper">
+    <div class="card">
+        <div class="logo-row">
+            <div class="orb">∞</div>
+            <div>
+                <div class="brand-title">Balance Watcher Universe</div>
+                <div class="brand-sub">Trung tâm giám sát số dư &amp; cảnh báo Telegram theo thời gian gần thực</div>
+            </div>
+        </div>
+        <div class="main-title">
+            <div>Quantum Balance Monitor</div>
+            <span class="accent">phiên bản Render-ready</span>
+        </div>
+        <div class="badge-linh">
+            <div class="check">✓</div>
+            <div>Bot được bảo dưỡng &amp; phát triển bởi <strong>Admin Văn Linh</strong></div>
+        </div>
         {% with messages = get_flashed_messages(with_categories=true) %}
           {% if messages %}
-            {% for category, message in messages %}
-              <div class="bg-red-900 border-red-500 text-red-300 border-l-4 px-4 py-3 rounded-lg relative mb-4" role="alert">
-                <span class="block sm:inline">{{ message }}</span>
-              </div>
+            {% for cat, msg in messages %}
+              <div class="flash {% if cat == 'error' %}flash-error{% endif %}">{{ msg }}</div>
             {% endfor %}
           {% endif %}
         {% endwith %}
-        
-        <form action="{{ url_for('login_handler') }}" method="POST" class="space-y-6">
-            <div>
-                <label for="secret_key" class="block text-sm font-medium text-gray-400">Secret Key</label>
-                <input type="password" name="secret_key" id="secret_key" placeholder="Nhập key bí mật của bạn" class="mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-cyan-500 focus:border-cyan-500 text-white" required>
+        {% block content %}{% endblock %}
+    </div>
+</div>
+</body>
+</html>
+"""
+
+LOGIN_TEMPLATE = r"""
+{% extends "base.html" %}
+{% block content %}
+<div class="grid">
+    <div class="panel">
+        <div class="panel-header">
+            <div class="panel-title">Đăng nhập bảng điều khiển</div>
+            <div class="chip">Mã hoá phiên &amp; khoá bí mật</div>
+        </div>
+        <form method="post">
+            <label>Mật khẩu truy cập (do bạn cấu hình trong ADMIN_PASSWORD)</label>
+            <input type="password" name="password" placeholder="Nhập mật khẩu siêu bí mật..." required>
+            <div class="btn-row">
+                <button type="submit" class="btn">
+                    <span>🚀 Vào vũ trụ giám sát</span>
+                </button>
             </div>
-            <button type="submit" class="w-full inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-blue-500 transition-all">
-                Truy Cập
-            </button>
         </form>
     </div>
-</body>
-</html>
-"""
-
-# Giao diện Bảng Điều Khiển
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="vi">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Bot Saldo (Cosmic Edition)</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <style>
-        body { 
-            font-family: 'Inter', sans-serif;
-            background-color: #0B1120;
-            background-image: radial-gradient(circle at 1px 1px, rgba(200, 200, 255, 0.1) 1px, transparent 0);
-            background-size: 20px 20px;
-        }
-        /* Tùy chỉnh thanh cuộn chuyên nghiệp */
-        ::-webkit-scrollbar { width: 8px; height: 8px; }
-        ::-webkit-scrollbar-track { background: #1f2937; }
-        ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 4px; }
-        ::-webkit-scrollbar-thumb:hover { background: #6b7280; }
-    </style>
-</head>
-<body class="text-gray-200 min-h-screen">
-    <div class="container mx-auto p-4 md:p-8 max-w-7xl">
-        
-        {% with messages = get_flashed_messages(with_categories=true) %}
-          {% if messages %}
-            {% for category, message in messages %}
-              <div class="{% if category == 'error' %}bg-red-900 border-red-500 text-red-300{% else %}bg-green-900 border-green-500 text-green-300{% endif %} border-l-4 px-4 py-3 rounded-lg relative mb-4 shadow-lg" role="alert">
-                <span class="block sm:inline">{{ message }}</span>
-              </div>
-            {% endfor %}
-          {% endif %}
-        {% endwith %}
-        
-        <div class="flex flex-col md:flex-row justify-between md:items-center mb-6 space-y-2 md:space-y-0">
-            <h1 class="text-4xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-purple-400 to-cyan-400">
-                Bảng Điều Khiển Saldo Bot
-            </h1>
-            <a href="{{ url_for('logout') }}" class="text-sm text-gray-500 hover:text-red-400 transition-colors">Đăng Xuất</a>
+    <div class="panel">
+        <div class="panel-header">
+            <div class="panel-title">Hướng dẫn triển khai nhanh</div>
         </div>
-        
-        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            
-            <div class="lg:col-span-1 space-y-6">
-                
-                <div class="bg-gray-800/70 backdrop-blur-sm rounded-lg shadow-2xl p-6 border border-gray-700">
-                    <h2 class="text-xl font-semibold text-cyan-400 mb-5 border-b border-gray-700 pb-2">Cài Đặt Chung</h2>
-                    <form action="{{ url_for('update_settings') }}" method="POST" class="space-y-4">
-                        <div>
-                            <label for="default_chat_id" class="block text-sm font-medium text-gray-400">Chat ID Mặc Định</label>
-                            <input type="text" name="default_chat_id" id="default_chat_id" value="{{ settings.get('default_chat_id', '') }}" placeholder="ID của bạn hoặc nhóm (ví dụ: -1001...)" class="mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-cyan-500 focus:border-cyan-500 text-white">
-                        </div>
-                        <div>
-                            <label for="default_bot_id" class="block text-sm font-medium text-gray-400">Bot Gửi Mặc Định</label>
-                            <select name="default_bot_id" id="default_bot_id" class="mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-cyan-500 focus:border-cyan-500 text-white">
-                                <option value="">-- Không chọn --</option>
-                                {% for bot in all_bots %}
-                                <option value="{{ bot.id }}" {% if settings.get('default_bot_id') == bot.id|string %}selected{% endif %}>{{ bot.bot_name }}</option>
-                                {% endfor %}
-                            </select>
-                        </div>
-                        <button type="submit" class="w-full inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-gradient-to-r from-indigo-500 to-purple-500 hover:from-indigo-600 hover:to-purple-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-indigo-500 transition-all">
-                            Lưu Cài Đặt
-                        </button>
-                    </form>
-                </div>
-
-                <div class="bg-gray-800/70 backdrop-blur-sm rounded-lg shadow-2xl p-6 border border-gray-700">
-                    <h2 class="text-xl font-semibold text-cyan-400 mb-5 border-b border-gray-700 pb-2">Quản Lý Bot Telegram</h2>
-                    <form action="{{ url_for('add_bot') }}" method="POST" class="space-y-4 mb-6">
-                        <div>
-                            <label for="bot_name" class="block text-sm font-medium text-gray-400">Tên Bot (để phân biệt)</label>
-                            <input type="text" name="bot_name" id="bot_name" placeholder="Ví dụ: Bot Cảnh Báo" class="mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-cyan-500 focus:border-cyan-500 text-white" required>
-                        </div>
-                        <div>
-                            <label for="bot_token" class="block text-sm font-medium text-gray-400">Token Bot (từ BotFather)</label>
-                            <input type="text" name="bot_token" id="bot_token" placeholder="123456:ABC...XYZ" class="mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-cyan-500 focus:border-cyan-500 text-white" required>
-                        </div>
-                        <button type="submit" class="w-full inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-gradient-to-r from-green-500 to-teal-500 hover:from-green-600 hover:to-teal-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-green-500 transition-all">
-                            Thêm Bot Mới
-                        </button>
-                    </form>
-                    
-                    <h3 class="text-md font-semibold text-gray-300 mb-2">Bot Đang Quản Lý</h3>
-                    <ul class="divide-y divide-gray-700">
-                        {% for bot in all_bots %}
-                        <li class="py-3 flex items-center justify-between">
-                            <span class="text-sm text-gray-300">{{ bot.bot_name }} {% if settings.get('default_bot_id') == bot.id|string %}<span class="text-xs text-purple-400">(Mặc định)</span>{% endif %}</span>
-                            <div class="flex space-x-3">
-                                <form action="{{ url_for('test_bot') }}" method="POST" class="inline">
-                                    <input type="hidden" name="bot_id" value="{{ bot.id }}">
-                                    <input type="hidden" name="bot_name" value="{{ bot.bot_name }}">
-                                    <button type="submit" class="text-cyan-400 hover:text-cyan-300 text-sm font-medium transition-colors">Test</button>
-                                </form>
-                                <form action="{{ url_for('delete_bot') }}" method="POST" class="inline" onsubmit="return confirm('Bạn có chắc chắn muốn xóa bot này?');">
-                                    <input type="hidden" name="id" value="{{ bot.id }}">
-                                    <button type="submit" class="text-red-500 hover:text-red-400 text-sm font-medium transition-colors">Xóa</button>
-                                </form>
-                            </div>
-                        </li>
-                        {% else %}
-                        <li class="py-2 text-sm text-gray-500">Chưa có bot nào.</li>
-                        {% endfor %}
-                    </ul>
-                </div>
-                
-                <div class="bg-gray-800/70 backdrop-blur-sm rounded-lg shadow-2xl p-6 border border-gray-700">
-                    <h2 class="text-xl font-semibold text-cyan-400 mb-5 border-b border-gray-700 pb-2">Thêm Tài Khoản Web Mới</h2>
-                    
-                    {% if not all_bots %}
-                    <div class="bg-yellow-900 border-yellow-500 text-yellow-300 border-l-4 px-4 py-3 rounded-lg relative mb-4" role="alert">
-                        <strong class="font-bold">Lưu ý!</strong>
-                        <span class="block sm:inline">Bạn phải <a href="#bot_name" class="font-medium underline hover:text-yellow-100">thêm ít nhất 1 bot Telegram</a> trước.</span>
-                    </div>
-                    {% endif %}
-                    
-                    <form action="{{ url_for('add_account') }}" method="POST" class="space-y-4">
-                        <div>
-                            <label for="web_name" class="block text-sm font-medium text-gray-400">Tên Website</label>
-                            <input type="text" name="web_name" id="web_name" placeholder="Ví dụ: ShopACCMO" class="mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md shadow-sm text-white" required>
-                        </div>
-                        <div>
-                            <label for="api_key" class="block text-sm font-medium text-gray-400">API Key</label>
-                            <input type="text" name="api_key" id="api_key" placeholder="API key của bạn" class="mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md shadow-sm text-white" required>
-                        </div>
-                        <div>
-                            <label for="api_url" class="block text-sm font-medium text-gray-400">URL API Profile</label>
-                            <input type="text" name="api_url" id="api_url" value="https://www.shopaccmmo.com/api/profile.php" class="mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md shadow-sm text-white" required>
-                        </div>
-                        <div>
-                            <label for="threshold" class="block text-sm font-medium text-gray-400">Ngưỡng Cảnh Báo (VND)</label>
-                            <input type="number" name="threshold" id="threshold" placeholder="Ví dụ: 10000" class="mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md shadow-sm text-white" required>
-                        </div>
-                        
-                        <div>
-                            <label for="bot_id" class="block text-sm font-medium text-gray-400">Bot gửi thông báo</label>
-                            <select name="bot_id" id="bot_id" class="mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md shadow-sm text-white" {% if not all_bots %}disabled{% endif %}>
-                                <option value="">-- Dùng Bot Mặc Định --</option>
-                                {% for bot in all_bots %}
-                                <option value="{{ bot.id }}">{{ bot.bot_name }}</option>
-                                {% endfor %}
-                            </select>
-                        </div>
-                        
-                        <div>
-                            <label for="chat_id" class="block text-sm font-medium text-gray-400">Chat ID (Người nhận)</label>
-                            <input type="text" name="chat_id" id="chat_id" placeholder="Bỏ trống để dùng Chat ID Mặc định" class="mt-1 block w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md shadow-sm text-white">
-                        </div>
-
-                        <button type="submit" class="w-full inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-blue-500 transition-all" {% if not all_bots %}disabled{% endif %}>
-                            Thêm Tài Khoản Web
-                        </button>
-                    </form>
-                </div>
-
-                <div class="bg-gray-800/70 backdrop-blur-sm rounded-lg shadow-2xl p-6 border border-gray-700">
-                    <h2 class="text-xl font-semibold text-cyan-400 mb-5 border-b border-gray-700 pb-2">Quản Lý Dữ Liệu (JSON)</h2>
-                    <div class="grid grid-cols-1 gap-4">
-                        <div>
-                            <h3 class="text-lg font-medium text-gray-300 mb-2">Tải Backup (Export)</h3>
-                            <a href="{{ url_for('export_json') }}" class="w-full inline-flex justify-center py-2 px-4 border border-gray-600 shadow-sm text-sm font-medium rounded-md text-gray-200 bg-gray-600 hover:bg-gray-500 transition-colors">
-                                Tải Backup (.json)
-                            </a>
-                        </div>
-                        <div>
-                            <h3 class="text-lg font-medium text-gray-300 mb-2">Restore từ Backup (Import)</h3>
-                            <form action="{{ url_for('import_json') }}" method="POST" enctype="multipart/form-data" 
-                                  onsubmit="return confirm('BẠN CÓ CHẮC CHẮN MUỐN GHI ĐÈ TOÀN BỘ DỮ LIỆU HIỆN TẠI BẰNG FILE NÀY KHÔNG?');">
-                                <input type="file" name="backup_file" accept=".json" required class="block w-full text-sm text-gray-400
-                                  file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-semibold
-                                  file:bg-gray-700 file:text-cyan-400 hover:file:bg-gray-600 mb-2 transition-colors"/>
-                                <button type="submit" class="w-full inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-gradient-to-r from-red-600 to-orange-500 hover:from-red-700 hover:to-orange-600 transition-all">
-                                    Upload & Restore
-                                </button>
-                            </form>
-                        </div>
-                    </div>
-                </div>
-                </div>
-            
-            <div class="lg:col-span-2">
-                <div class="bg-gray-800/70 backdrop-blur-sm rounded-lg shadow-2xl p-6 md:p-8 border border-gray-700">
-                    <h2 class="text-xl font-semibold text-cyan-400 mb-5 border-b border-gray-700 pb-2">Trạng Thái Tài Khoản</h2>
-                    <div class="overflow-x-auto">
-                        <table class="min-w-full divide-y divide-gray-700">
-                            <thead class="bg-gray-900/50">
-                                <tr>
-                                    <th class="px-5 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Tên Web</th>
-                                    <th class="px-5 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Bot</th>
-                                    <th class="px-5 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Chat ID</th>
-                                    <th class="px-5 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Ngưỡng</th>
-                                    
-                                    <th class="px-5 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Số Dư Cuối</th>
-                                    
-                                    <th class="px-5 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Trạng Thái</th>
-                                    <th class="px-5 py-3 text-right text-xs font-semibold text-gray-400 uppercase tracking-wider">Xóa</th>
-                                </tr>
-                            </thead>
-                            <tbody class="bg-gray-800 divide-y divide-gray-700">
-                                {% for acc in accounts %}
-                                <tr class="hover:bg-gray-700/50 transition-colors">
-                                    <td class="px-5 py-4 whitespace-nowrap text-sm font-medium text-white">{{ acc.web_name }}</td>
-                                    <td class="px-5 py-4 whitespace-nowrap text-sm text-gray-400">
-                                        {% if acc.bot_name %}
-                                            {{ acc.bot_name }} <span class="text-blue-400">(Chỉ định)</span>
-                                        {% else %}
-                                            <span class="text-gray-500">(Mặc định)</span>
-                                        {% endif %}
-                                    </td>
-                                    <td class="px-5 py-4 whitespace-nowrap text-sm text-gray-400">
-                                        {% if acc.chat_id %}
-                                            {{ acc.chat_id }} <span class="text-blue-400">(Chỉ định)</span>
-                                        {% else %}
-                                            <span class="text-gray-500">(Mặc định)</span>
-                                        {% endif %}
-                                    </td>
-                                    <td class="px-5 py-4 whitespace-nowrap text-sm text-gray-400">{{ "{:,.0f}đ".format(acc.threshold) }}</td>
-                                    <td class="px-5 py-4 whitespace-nowrap text-sm text-gray-300 font-semibold">{{ "{:,.0f}đ".format(acc.last_balance) if acc.last_balance is not None else 'N/A' }}</td>
-                                    
-                                    <td class="px-5 py-4 whitespace-nowrap text-sm">
-                                        {% if acc.last_status == 'OK' %}
-                                            <span class="px-3 py-1 inline-flex text-xs leading-5 font-semibold rounded-full bg-green-900 text-green-300">OK</span>
-                                        
-                                        {% elif acc.last_status is not none and acc.last_status != 'OK' %}
-                                            <span class="px-3 py-1 inline-flex text-xs leading-5 font-semibold rounded-full bg-red-900 text-red-300" title="{{ acc.last_status }}">Lỗi</span>
-                                        
-                                        {% else %}
-                                            <span class="px-3 py-1 inline-flex text-xs leading-5 font-semibold rounded-full bg-gray-700 text-gray-400">Chưa rõ</span>
-                                        {% endif %}
-                                    </td>
-                                    <td class="px-5 py-4 whitespace-nowrap text-right text-sm font-medium">
-                                        <form action="{{ url_for('delete_account') }}" method="POST" onsubmit="return confirm('Bạn có chắc chắn muốn xóa tài khoản web này?');">
-                                            <input type="hidden" name="id" value="{{ acc.id }}">
-                                            <button type="submit" class="text-red-500 hover:text-red-400 transition-colors">Xóa</button>
-                                        </form>
-                                    </td>
-                                </tr>
-                                {% endfor %}
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
+        <div style="font-size:10px; color:var(--text-soft); line-height:1.7;">
+            <ol style="padding-left:14px; margin:0;">
+                <li>Deploy lên Render (Python, Gunicorn, Flask).</li>
+                <li>Đặt biến môi trường <b>ADMIN_PASSWORD</b> &amp; <b>SECRET_KEY</b>.</li>
+                <li>Đăng nhập, cấu hình <b>Telegram BOT TOKEN(s)</b> &amp; <b>CHAT ID</b>.</li>
+                <li>Thêm các URL API số dư (VD: ShopAccMMO profile API).</li>
+                <li>Watcher sẽ theo dõi &amp; bắn cảnh báo khi số dư đổi.</li>
+            </ol>
+            <div style="margin-top:8px;">
+                Không share link dashboard/pw ra ngoài. Toàn bộ brand thuộc <b>Admin Văn Linh</b>.
             </div>
         </div>
     </div>
-</body>
-</html>
+</div>
+{% endblock %}
 """
 
+DASHBOARD_TEMPLATE = r"""
+{% extends "base.html" %}
+{% block content %}
+<div class="grid">
+    <!-- LEFT: TELEGRAM + GLOBAL -->
+    <div class="panel">
+        <div class="panel-header">
+            <div class="panel-title">Cấu hình Telegram &amp; hệ thống</div>
+            <div class="chip">Nhiều BOT TOKEN → 1 CHAT_ID</div>
+        </div>
+        <form method="post" action="{{ url_for('save_telegram') }}">
+            <label>TELEGRAM_CHAT_ID (nhận thông báo)</label>
+            <input type="text" name="telegram_chat_id"
+                   placeholder="VD: 123456789 (nên dùng ID thay vì @username)"
+                   value="{{ config.telegram_chat_id or '' }}">
+            <label>Danh sách TELEGRAM_BOT_TOKEN (mỗi dòng 1 token)</label>
+            <textarea name="telegram_bots"
+                      placeholder="123456:ABC-DEF...&#10;987654:XYZ-...">{{ '\n'.join(config.telegram_bots) if config.telegram_bots else '' }}</textarea>
+            <label>Chu kỳ quét (giây) - từ biến môi trường POLL_INTERVAL = {{ poll_interval }}</label>
+            <input type="text" value="{{ poll_interval }}" disabled>
+            <div class="btn-row">
+                <button type="submit" class="btn">
+                    <span>💾 Lưu cấu hình Telegram</span>
+                </button>
+                <a href="{{ url_for('backup') }}" class="btn btn-soft">
+                    📦 Tải backup thủ công
+                </a>
+            </div>
+        </form>
+        <div style="margin-top:10px; font-size:9px; color:var(--text-soft);">
+            Gợi ý:
+            <ul style="margin:4px 0 0 13px; padding:0;">
+                <li>Có thể nhập nhiều BOT TOKEN, tất cả sẽ gửi về cùng 1 CHAT_ID.</li>
+                <li>Không để lộ CHAT_ID &amp; BOT TOKEN trong ảnh/chia sẻ.</li>
+            </ul>
+        </div>
+    </div>
 
-# --- Khởi tạo CSDL ---
-def init_db():
-    print(f"Kiểm tra và khởi tạo CSDL tại: {DATABASE_FILE}")
+    <!-- RIGHT: API LIST / ADD -->
+    <div class="panel">
+        <div class="panel-header">
+            <div class="panel-title">Danh sách API số dư</div>
+            <div class="chip">Auto CỘNG TIỀN / THANH TOÁN</div>
+        </div>
+        <form method="post" action="{{ url_for('add_api') }}">
+            <label>Tên hiển thị</label>
+            <input type="text" name="name" placeholder="VD: ShopAccMMO chính" required>
+            <label>URL API kiểm tra số dư</label>
+            <input type="text" name="url" placeholder="https://.../api/profile.php?api_key=..." required>
+            <label>Trường số dư trong JSON (default: balance) — hỗ trợ dạng: data.balance</label>
+            <input type="text" name="balance_field" placeholder="balance" value="balance">
+            <div class="btn-row">
+                <button type="submit" class="btn">
+                    <span>➕ Thêm API mới</span>
+                </button>
+            </div>
+        </form>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Tên</th>
+                    <th>URL</th>
+                    <th>Trường</th>
+                    <th>Số dư gần nhất</th>
+                    <th>Cập nhật</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% if config.apis %}
+                    {% for api in config.apis %}
+                    <tr>
+                        <td><span class="pill pill-id">{{ api.id }}</span></td>
+                        <td>{{ api.name }}</td>
+                        <td style="max-width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+                            {{ api.url }}
+                        </td>
+                        <td>{{ api.balance_field }}</td>
+                        {% set st = state.get(api.id_str) %}
+                        {% if st and st.last_balance is not none %}
+                            <td><span class="pill pill-ok">{{ st.last_balance }}</span></td>
+                            <td style="font-size:8px;">{{ st.last_change or '-' }}</td>
+                        {% else %}
+                            <td><span class="pill pill-unknown">chưa có dữ liệu</span></td>
+                            <td>-</td>
+                        {% endif %}
+                        <td>
+                            <form method="post"
+                                  action="{{ url_for('delete_api', api_id=api.id) }}"
+                                  onsubmit="return confirm('Xoá API này?');">
+                                <button type="submit" class="btn btn-soft btn-danger">✖</button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                {% else %}
+                    <tr>
+                        <td colspan="7"
+                            style="text-align:center; font-size:9px; padding:10px 0; color:var(--text-soft);">
+                            Chưa có API nào. Thêm ít nhất một đường dẫn API số dư để bắt đầu.
+                        </td>
+                    </tr>
+                {% endif %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<div class="footer">
+    <div>
+        Trạng thái watcher:
+        {% if watcher_running %}
+            <span class="pill pill-ok">Đang chạy nền</span>
+        {% else %}
+            <span class="pill pill-unknown">Chưa kích hoạt</span>
+        {% endif %}
+        <span style="margin-left:6px;">POLL_INTERVAL={{ poll_interval }}s</span>
+    </div>
+    <div>
+        <a href="{{ url_for('logout') }}" class="logout-link">Đăng xuất</a>
+    </div>
+</div>
+{% endblock %}
+"""
+
+# ---------------------- Flask app & Jinja loader ----------------------
+app = Flask(__name__)
+app.secret_key = SECRET_KEY
+
+dict_loader = DictLoader({"base.html": BASE_TEMPLATE})
+if app.jinja_loader:
+    app.jinja_loader = ChoiceLoader([dict_loader, app.jinja_loader])
+else:
+    app.jinja_loader = dict_loader
+
+# ---------------------- JSON helpers ----------------------
+def _ensure_paths():
+    if not os.path.exists(CONFIG_PATH):
+        _save_json(CONFIG_PATH, {"telegram_chat_id": "", "telegram_bots": [], "apis": []})
+    if not os.path.exists(STATE_PATH):
+        _save_json(STATE_PATH, {})
+
+def _load_json(path: str, default: Any):
     try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        c = conn.cursor()
-        
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS telegram_bots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                bot_name TEXT NOT NULL,
-                bot_token TEXT NOT NULL UNIQUE
-            )
-        ''')
-        
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS global_settings (
-                setting_key TEXT PRIMARY KEY,
-                setting_value TEXT
-            )
-        ''')
-        
-        c.execute("INSERT OR IGNORE INTO global_settings (setting_key, setting_value) VALUES (?, ?)", ('default_chat_id', ''))
-        c.execute("INSERT OR IGNORE INTO global_settings (setting_key, setting_value) VALUES (?, ?)", ('default_bot_id', ''))
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
 
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS accounts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                web_name TEXT NOT NULL,
-                api_key TEXT NOT NULL,
-                api_url TEXT NOT NULL,
-                threshold REAL NOT NULL,
-                chat_id TEXT, 
-                last_balance REAL,
-                last_status TEXT,
-                bot_id INTEGER REFERENCES telegram_bots(id) ON DELETE SET NULL
-            )
-        ''')
-        
-        # Logic kiểm tra và nâng cấp CSDL cũ
-        try:
-            c.execute("PRAGMA table_info(accounts)")
-            cols = c.fetchall()
-            has_bot_id = any(col[1] == 'bot_id' for col in cols)
-            
-            if not has_bot_id:
-                 print("Phát hiện CSDL cũ, đang nâng cấp bảng 'accounts' (thêm bot_id)...")
-                 c.execute("ALTER TABLE accounts ADD COLUMN bot_id INTEGER REFERENCES telegram_bots(id) ON DELETE SET NULL")
-                 print("Nâng cấp bảng 'accounts' thành công.")
+def _save_json(path: str, data: Any):
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
 
-        except Exception as e:
-            print(f"Lỗi khi kiểm tra nâng cấp CSDL: {e}")
-
-        conn.commit()
-        conn.close()
-        print("Cơ sở dữ liệu đã sẵn sàng.")
-    except Exception as e:
-        print(f"Lỗi khi khởi tạo CSDL: {e}", file=sys.stderr)
-
-# --- Hàm gửi thông báo Telegram ---
-def send_telegram_message(message, chat_id, bot_token):
-    if not bot_token:
-        print(f"Lỗi: Không tìm thấy bot token. Bỏ qua gửi tin nhắn.", file=sys.stderr)
-        return False, "Không tìm thấy bot token"
-    if not chat_id:
-        print(f"Lỗi: Không tìm thấy chat ID. Bỏ qua gửi tin nhắn.", file=sys.stderr)
-        return False, "Không tìm thấy chat ID"
-
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = { 'chat_id': chat_id, 'text': message, 'parse_mode': 'Markdown' }
-    try:
-        response = requests.post(url, json=payload, timeout=5)
-        if response.status_code == 200:
-            print(f"Đã gửi thông báo tới {chat_id} (sử dụng token ...{bot_token[-6:]})")
-            return True, "Thành công"
-        else:
-            error_msg = f"Lỗi Telegram: {response.text}"
-            print(f"Lỗi khi gửi thông báo tới {chat_id}: {error_msg}", file=sys.stderr)
-            return False, error_msg
-    except Exception as e:
-        error_msg = f"Lỗi Mạng: {str(e)}"
-        print(f"Lỗi mạng khi gửi thông báo: {error_msg}", file=sys.stderr)
-        return False, error_msg
-
-# --- Lõi Bot: Hàm kiểm tra Saldo ---
-def check_balances():
-    print("Bắt đầu phiên kiểm tra saldo...")
-        
-    try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        
-        c.execute("SELECT * FROM global_settings")
-        settings_db = c.fetchall()
-        settings = {row['setting_key']: row['setting_value'] for row in settings_db}
-        
-        default_chat_id = settings.get('default_chat_id')
-        default_bot_id = settings.get('default_bot_id')
-        default_bot_token = None
-
-        if default_bot_id:
-            c.execute("SELECT bot_token FROM telegram_bots WHERE id = ?", (default_bot_id,))
-            bot_row = c.fetchone()
-            if bot_row:
-                default_bot_token = bot_row['bot_token']
-            else:
-                print(f"Cảnh báo: Không tìm thấy bot mặc định (ID: {default_bot_id})", file=sys.stderr)
-
-        query = """
-        SELECT 
-            a.id, a.web_name, a.api_key, a.api_url, a.threshold, 
-            a.chat_id, a.bot_id, 
-            a.last_balance, a.last_status,
-            b.bot_token 
-        FROM accounts a
-        LEFT JOIN telegram_bots b ON a.bot_id = b.id
-        """
-        c.execute(query)
-        accounts = c.fetchall()
-        
-    except Exception as e:
-        print(f"Lỗi khi đọc CSDL: {e}", file=sys.stderr)
-        if "no such table" in str(e):
-            init_db() # Cố gắng tạo lại CSDL nếu nó bị mất
-        return
-
-    for acc in accounts:
-        web_name = acc['web_name']
-        chat_id_to_use = acc['chat_id'] if acc['chat_id'] else default_chat_id
-        bot_token_to_use = acc['bot_token'] if acc['bot_token'] else default_bot_token
-        
-        if not bot_token_to_use:
-            print(f"Bỏ qua {web_name}: Không có bot (cụ thể hay mặc định) được gán.", file=sys.stderr)
+def load_config() -> Dict[str, Any]:
+    _ensure_paths()
+    with lock:
+        raw = _load_json(CONFIG_PATH, {})
+    telegram_chat_id = raw.get("telegram_chat_id", "") or ""
+    telegram_bots = raw.get("telegram_bots", []) or []
+    apis_raw = raw.get("apis", []) or []
+    apis = []
+    for idx, api in enumerate(apis_raw, start=1):
+        if not api:
             continue
-        if not chat_id_to_use:
-            print(f"Bỏ qua {web_name}: Không có Chat ID (cụ thể hay mặc định) được gán.", file=sys.stderr)
+        aid = api.get("id", idx)
+        name = api.get("name", f"API #{aid}")
+        url = (api.get("url") or "").strip()
+        balance_field = (api.get("balance_field") or "balance").strip() or "balance"
+        if not url:
             continue
-
-        api_key = acc['api_key']
-        api_url = acc['api_url']
-        threshold = acc['threshold']
-        old_balance = acc['last_balance']
-        full_api_url = f"{api_url}?api_key={api_key}"
-        new_status = "Lỗi Request"
-        new_balance = None
-
-        try:
-            r = requests.get(full_api_url, timeout=10)
-            data = r.json()
-            
-            # Logic lấy số dư: Cố gắng lấy từ 'data' hoặc trực tiếp từ root, dùng key 'balance' hoặc 'sodu'
-            if data.get('status') == True or data.get('success') == True:
-                user_data = data.get('data', data)
-                new_balance_str = user_data.get('balance', user_data.get('sodu'))
-                if new_balance_str is None:
-                    new_status = "Lỗi: Không tìm thấy 'balance' hoặc 'sodu' trong API."
-                else:
-                    new_balance = float(new_balance_str)
-                    new_status = "OK"
-            else:
-                new_status = f"Lỗi API: {data.get('msg', 'Lỗi không xác định')}"
-
-            if new_status == "OK":
-                print(f"Kiểm tra {web_name}: Thành công. Số dư: {new_balance:,.0f}đ")
-                if old_balance is not None:
-                    if abs(new_balance - old_balance) >= 1: # Kiểm tra biến động đáng kể
-                        if new_balance < old_balance:
-                            diff = old_balance - new_balance
-                            msg = (f"✅ GIAO DỊCH THÀNH CÔNG ({web_name})\n\n"
-                                   f"Nội dung: Thanh toán đơn hàng\n"
-                                   f"Tổng trừ (Gồm phí): *-{diff:,.0f}đ*\n"
-                                   f"Số dư cuối: *{new_balance:,.0f}đ*")
-                            send_telegram_message(msg, chat_id_to_use, bot_token_to_use)
-                        elif new_balance > old_balance:
-                            diff = new_balance - old_balance
-                            msg = (f"💰 NHẬN TIỀN THÀNH CÔNG ({web_name})\n\n"
-                                   f"Nội dung: Nạp tiền vào tài khoản\n"
-                                   f"Biến động: *+{diff:,.0f}đ*\n"
-                                   f"Số dư cuối: *{new_balance:,.0f}đ*")
-                            send_telegram_message(msg, chat_id_to_use, bot_token_to_use)
-                
-                # Cảnh báo ngưỡng: Chỉ gửi nếu số dư mới thấp hơn ngưỡng VÀ số dư cũ cao hơn ngưỡng.
-                # Điều này tránh spam thông báo mỗi lần quét khi đã dưới ngưỡng.
-                is_below_threshold = new_balance < threshold
-                was_above_threshold = old_balance is None or old_balance >= threshold
-                
-                if is_below_threshold and was_above_threshold:
-                    msg = (f"🔥 SỐ DƯ SẮP HẾT ({web_name}) 🔥\n\n"
-                           f"Tài khoản chỉ còn *{new_balance:,.0f}đ* (Dưới ngưỡng *{threshold:,.0f}đ*).\n"
-                           f"👉 Vui lòng nạp tiền GẤP!")
-                    send_telegram_message(msg, chat_id_to_use, bot_token_to_use)
-
-            else: 
-                print(f"Lỗi API từ {web_name}: {new_status}", file=sys.stderr)
-                # Chỉ gửi thông báo nếu trạng thái trước đó là OK hoặc chưa từng quét
-                if acc['last_status'] == 'OK' or acc['last_status'] == 'Mới' or acc['last_status'] is None: 
-                    msg = (f"❌ LỖI API ({web_name})\n\n"
-                           f"Không thể kiểm tra số dư. Server báo:\n"
-                           f"`{new_status}`\n\n"
-                           f"Kiểm tra lại API key hoặc liên hệ admin web.")
-                    send_telegram_message(msg, chat_id_to_use, bot_token_to_use)
-
-        except requests.exceptions.RequestException as e:
-            new_status = f"Lỗi Mạng: {str(e)}"
-            print(f"Lỗi Mạng {web_name}: {new_status}", file=sys.stderr)
-        except Exception as e:
-            new_status = f"Lỗi Phân Tích: {str(e)}"
-            print(f"Lỗi Phân Tích {web_name}: {new_status}", file=sys.stderr)
-
-        try:
-            c.execute("UPDATE accounts SET last_balance = ?, last_status = ? WHERE id = ?",
-                      (new_balance if new_balance is not None else old_balance, new_status, acc['id']))
-            conn.commit()
-        except Exception as e:
-            print(f"Lỗi khi cập nhật CSDL cho {web_name}: {e}", file=sys.stderr)
-
-    conn.close()
-    print("Hoàn tất phiên kiểm tra.")
-
-# --- Ứng dụng Web Flask (Các route không thay đổi) ---
-# ... (Giữ nguyên các route từ login_page đến delete_account và các hàm JSON) ...
-
-@app.route('/')
-def login_page():
-    if 'authenticated' in session:
-        return redirect(url_for('dashboard'))
-    return render_template_string(HTML_LOGIN)
-
-@app.route('/login', methods=['POST'])
-def login_handler():
-    secret_key = request.form.get('secret_key')
-    if secret_key == ADMIN_PASSWORD:
-        session['authenticated'] = True
-        return redirect(url_for('dashboard'))
-    else:
-        flash('Secret Key không chính xác!', 'error')
-        return redirect(url_for('login_page'))
-
-@app.route('/logout')
-def logout():
-    session.pop('authenticated', None)
-    flash('Bạn đã đăng xuất.', 'success')
-    return redirect(url_for('login_page'))
-
-@app.route('/dashboard')
-@login_required
-def dashboard():
-    try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        
-        c.execute("SELECT * FROM global_settings")
-        settings_db = c.fetchall()
-        settings = {row['setting_key']: row['setting_value'] for row in settings_db}
-        
-        c.execute("""
-            SELECT a.*, b.bot_name 
-            FROM accounts a 
-            LEFT JOIN telegram_bots b ON a.bot_id = b.id
-            ORDER BY a.web_name
-        """)
-        accounts = c.fetchall()
-        
-        c.execute("SELECT * FROM telegram_bots ORDER BY bot_name")
-        all_bots = c.fetchall()
-        
-        conn.close()
-        return render_template_string(HTML_TEMPLATE, accounts=accounts, all_bots=all_bots, settings=settings)
-    except Exception as e:
-        flash(f"Lỗi khi tải dữ liệu: {e}", 'error')
-        if 'no such table' in str(e):
-            init_db()
-            flash('Lỗi CSDL: Đã thử khởi tạo lại. Vui lòng F5 trang.', 'error')
-        return render_template_string(HTML_TEMPLATE, accounts=[], all_bots=[], settings={})
-
-@app.route('/update_settings', methods=['POST'])
-@login_required
-def update_settings():
-    try:
-        default_chat_id = request.form['default_chat_id'].strip()
-        default_bot_id = request.form['default_bot_id']
-        
-        conn = sqlite3.connect(DATABASE_FILE)
-        c = conn.cursor()
-        c.execute("UPDATE global_settings SET setting_value = ? WHERE setting_key = ?", (default_chat_id, 'default_chat_id'))
-        c.execute("UPDATE global_settings SET setting_value = ? WHERE setting_key = ?", (default_bot_id, 'default_bot_id'))
-        conn.commit()
-        conn.close()
-        flash('Lưu cài đặt chung thành công!', 'success')
-    except Exception as e:
-        flash(f"Lỗi khi lưu cài đặt: {e}", 'error')
-    return redirect(url_for('dashboard'))
-
-@app.route('/add_bot', methods=['POST'])
-@login_required
-def add_bot():
-    try:
-        bot_name = request.form['bot_name']
-        bot_token = request.form['bot_token']
-        conn = sqlite3.connect(DATABASE_FILE)
-        c = conn.cursor()
-        c.execute("INSERT INTO telegram_bots (bot_name, bot_token) VALUES (?, ?)", (bot_name, bot_token))
-        conn.commit()
-        conn.close()
-        flash('Thêm bot mới thành công!', 'success')
-    except sqlite3.IntegrityError:
-        flash(f"Lỗi: Token này đã tồn tại.", 'error')
-    except Exception as e:
-        flash(f"Lỗi khi thêm bot: {e}", 'error')
-    return redirect(url_for('dashboard'))
-
-@app.route('/delete_bot', methods=['POST'])
-@login_required
-def delete_bot():
-    try:
-        bot_id = int(request.form['id'])
-        conn = sqlite3.connect(DATABASE_FILE)
-        c = conn.cursor()
-        c.execute("DELETE FROM telegram_bots WHERE id = ?", (bot_id,))
-        c.execute("UPDATE global_settings SET setting_value = '' WHERE setting_key = 'default_bot_id' AND setting_value = ?", (str(bot_id),))
-        conn.commit()
-        conn.close()
-        flash('Xóa bot thành công!', 'success')
-    except Exception as e:
-        flash(f"Lỗi khi xóa bot: {e}", 'error')
-    return redirect(url_for('dashboard'))
-
-@app.route('/test_bot', methods=['POST'])
-@login_required
-def test_bot():
-    try:
-        bot_id = int(request.form['bot_id'])
-        bot_name = request.form['bot_name']
-        
-        conn = sqlite3.connect(DATABASE_FILE)
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        
-        c.execute("SELECT bot_token FROM telegram_bots WHERE id = ?", (bot_id,))
-        bot_row = c.fetchone()
-        if not bot_row:
-            flash(f"Lỗi: Không tìm thấy bot '{bot_name}'.", 'error')
-            return redirect(url_for('dashboard'))
-        bot_token = bot_row['bot_token']
-        
-        c.execute("SELECT setting_value FROM global_settings WHERE setting_key = 'default_chat_id'")
-        chat_id_row = c.fetchone()
-        default_chat_id = chat_id_row['setting_value'] if chat_id_row else None
-        
-        if not default_chat_id:
-            flash("Lỗi: Vui lòng nhập 'Chat ID Mặc Định' ở mục Cài Đặt Chung trước khi test.", 'error')
-            conn.close()
-            return redirect(url_for('dashboard'))
-
-        test_msg = f"✅ [THỬ NGHIỆM THÀNH CÔNG]\n\nBot '{bot_name}' đã kết nối thành công tới Chat ID này. Đang lấy báo cáo tổng quan..."
-        is_success, error_msg = send_telegram_message(test_msg, default_chat_id, bot_token)
-        
-        if is_success:
-            flash(f"Đã gửi thử thành công (Bot '{bot_name}'). Đang gửi báo cáo tổng quan...", 'success')
-            
-            c.execute("SELECT web_name, last_balance, last_status FROM accounts ORDER BY web_name")
-            accounts = c.fetchall()
-            
-            summary_msg = "📊 BÁO CÁO TỔNG QUAN (Từ lần quét cuối)\n\n"
-            if not accounts:
-                summary_msg += "Chưa có tài khoản web nào được cấu hình."
-            else:
-                for acc in accounts:
-                    balance_str = f"{acc['last_balance']:,.0f}đ" if acc['last_balance'] is not None else "Chưa rõ"
-                    
-                    if acc['last_status'] == 'OK':
-                        status_str = "✅ OK"
-                    elif acc['last_status'] is None:
-                        status_str = "Chưa quét"
-                    else:
-                        status_str = f"❌ Lỗi" 
-                        
-                    summary_msg += f"🌐 *{acc['web_name']}*:\n"
-                    summary_msg += f"   SỐ DƯ: *{balance_str}*\n"
-                    summary_msg += f"   TRẠNG THÁI: {status_str}\n\n"
-            
-            send_telegram_message(summary_msg, default_chat_id, bot_token)
-            
-        else:
-            flash(f"Gửi thử THẤT BẠI (Bot '{bot_name}')! Lý do: {error_msg}", 'error')
-            
-    except Exception as e:
-        flash(f"Lỗi khi gửi thử: {e}", 'error')
-    finally:
-        if 'conn' in locals() and conn:
-            conn.close()
-    return redirect(url_for('dashboard'))
-
-@app.route('/add', methods=['POST'])
-@login_required
-def add_account():
-    try:
-        web_name = request.form['web_name']
-        api_key = request.form['api_key']
-        api_url = request.form['api_url']
-        threshold = float(request.form['threshold'])
-        
-        chat_id = request.form['chat_id'].strip() or None
-        bot_id = int(request.form['bot_id']) if request.form['bot_id'] else None
-        
-        if not urlparse(api_url).scheme:
-            api_url = "https://" + api_url
-
-        conn = sqlite3.connect(DATABASE_FILE)
-        c = conn.cursor()
-        c.execute("""
-            INSERT INTO accounts (web_name, api_key, api_url, threshold, chat_id, bot_id, last_status) 
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (web_name, api_key, api_url, threshold, chat_id, bot_id, 'Mới'))
-        conn.commit()
-        conn.close()
-        flash('Thêm tài khoản web thành công!', 'success')
-    except Exception as e:
-        flash(f"Lỗi khi thêm tài khoản: {e}", 'error')
-    return redirect(url_for('dashboard'))
-
-@app.route('/delete', methods=['POST'])
-@login_required
-def delete_account():
-    try:
-        account_id = int(request.form['id'])
-        conn = sqlite3.connect(DATABASE_FILE)
-        c = conn.cursor()
-        c.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
-        conn.commit()
-        conn.close()
-        flash('Xóa tài khoản web thành công!', 'success')
-    except Exception as e:
-        flash(f"Lỗi khi xóa tài khoản web: {e}", 'error')
-    return redirect(url_for('dashboard'))
-
-@app.route('/export_json')
-@login_required
-def export_json():
-    try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-
-        c.execute("SELECT * FROM global_settings")
-        settings = [dict(row) for row in c.fetchall()]
-        
-        c.execute("SELECT * FROM telegram_bots")
-        bots = [dict(row) for row in c.fetchall()]
-        
-        c.execute("SELECT * FROM accounts")
-        accounts = [dict(row) for row in c.fetchall()]
-
-        conn.close()
-        
-        backup_data = {
-            "global_settings": settings,
-            "telegram_bots": bots,
-            "accounts": accounts
-        }
-        
-        json_str = json.dumps(backup_data, indent=2, ensure_ascii=False)
-        json_bytes = io.BytesIO(json_str.encode('utf-8'))
-        
-        return send_file(
-            json_bytes,
-            as_attachment=True,
-            download_name='saldo_bot_backup.json',
-            mimetype='application/json'
+        apis.append(
+            {
+                "id": int(aid),
+                "name": name,
+                "url": url,
+                "balance_field": balance_field,
+            }
         )
+    return {"telegram_chat_id": telegram_chat_id, "telegram_bots": telegram_bots, "apis": apis}
 
-    except Exception as e:
-        flash(f"Lỗi khi xuất file JSON: {e}", 'error')
-        return redirect(url_for('dashboard'))
+def save_config(config: Dict[str, Any]):
+    with lock:
+        _save_json(CONFIG_PATH, config)
 
-@app.route('/import_json', methods=['POST'])
-@login_required
-def import_json():
-    if 'backup_file' not in request.files:
-        flash('Không có file nào được chọn.', 'error')
-        return redirect(url_for('dashboard'))
-    file = request.files['backup_file']
-    if file.filename == '':
-        flash('Không có file nào được chọn.', 'error')
-        return redirect(url_for('dashboard'))
-        
-    if file and file.filename.endswith('.json'):
+def load_state() -> Dict[str, Any]:
+    _ensure_paths()
+    with lock:
+        st = _load_json(STATE_PATH, {})
+    return st if isinstance(st, dict) else {}
+
+def save_state(state: Dict[str, Any]):
+    with lock:
+        _save_json(STATE_PATH, state)
+
+def extract_field(data: Any, path: str):
+    if not path:
+        return None
+    parts = path.split(".")
+    v = data
+    for p in parts:
+        if isinstance(v, dict):
+            v = v.get(p)
+        else:
+            return None
+    return v
+
+def parse_balance(value: Any):
+    if value is None:
+        return None
+    try:
+        if isinstance(value, str):
+            cleaned = "".join(ch for ch in value if (ch.isdigit() or ch in ",.-"))
+            if cleaned.count(",") > 1 and "." not in cleaned:
+                cleaned = cleaned.replace(",", "")
+            cleaned = cleaned.replace(",", "")
+            return float(cleaned)
+        return float(value)
+    except Exception:
+        return None
+
+# ---------------------- Telegram ----------------------
+def send_telegram_message(tokens: List[str], chat_id: str, text: str):
+    if not tokens or not chat_id:
+        return
+    for token in tokens:
+        token = (token or "").strip()
+        if not token:
+            continue
         try:
-            data = json.load(io.TextIOWrapper(file.stream, encoding='utf-8'))
-            
-            scheduler.pause()
-            
-            conn = sqlite3.connect(DATABASE_FILE)
-            c = conn.cursor()
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            requests.post(
+                url,
+                data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+                timeout=10,
+            )
+        except Exception:
+            pass
 
-            c.execute("BEGIN TRANSACTION")
-            try:
-                c.execute("DELETE FROM accounts")
-                c.execute("DELETE FROM telegram_bots")
-                c.execute("DELETE FROM global_settings")
-                
-                if 'global_settings' in data:
-                    for setting in data['global_settings']:
-                        c.execute("INSERT INTO global_settings (setting_key, setting_value) VALUES (?, ?)",
-                                  (setting['setting_key'], setting['setting_value']))
-                
-                if 'telegram_bots' in data:
-                    for bot in data['telegram_bots']:
-                        c.execute("INSERT INTO telegram_bots (id, bot_name, bot_token) VALUES (?, ?, ?)",
-                                  (bot.get('id'), bot['bot_name'], bot['bot_token']))
-                
-                if 'accounts' in data:
-                    for acc in data['accounts']:
-                        c.execute("""
-                            INSERT INTO accounts (
-                                id, web_name, api_key, api_url, threshold, 
-                                chat_id, last_balance, last_status, bot_id
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (
-                            acc.get('id'), acc['web_name'], acc['api_key'], acc['api_url'], 
-                            acc['threshold'], acc.get('chat_id'), acc.get('last_balance'), 
-                            acc.get('last_status'), acc.get('bot_id')
-                        ))
-                
-                conn.commit()
-                flash('Restore CSDL từ file JSON thành công!', 'success')
-                
-            except Exception as e:
-                conn.rollback() 
-                flash(f"Lỗi khi ghi dữ liệu restore: {e}", 'error')
-            
-        except json.JSONDecodeError:
-            flash('Lỗi: File không phải là file JSON hợp lệ.', 'error')
-        except Exception as e:
-            flash(f"Lỗi khi restore: {e}", 'error')
-        finally:
-            if 'conn' in locals() and conn:
-                conn.close()
-            scheduler.resume()
-    else:
-        flash('File không hợp lệ. Chỉ chấp nhận file .json', 'error')
-        
-    return redirect(url_for('dashboard'))
+# ---------------------- Watcher thread ----------------------
+watcher_running = False
 
-# --- Khối chạy cuối cùng ---
-print("Đang khởi tạo CSDL...")
-init_db()
-print("Khởi tạo CSDL hoàn tất.")
+def watcher_loop():
+    global watcher_running
+    watcher_running = True
+    while True:
+        try:
+            cfg = load_config()
+            state = load_state()
 
-scheduler = BackgroundScheduler()
-# Giữ nguyên 2 phút như trong code gốc của bạn
-scheduler.add_job(func=check_balances, trigger="interval", minutes=2) 
-scheduler.start()
-print(f"Trình lập lịch đã bắt đầu, kiểm tra mỗi 2 PHÚT.")
+            bots = cfg.get("telegram_bots", [])
+            chat_id = (cfg.get("telegram_chat_id") or "").strip()
+            apis = cfg.get("apis", [])
 
-import atexit
-atexit.register(lambda: scheduler.shutdown())
+            for api in apis:
+                api_id = str(api["id"])
+                url = api["url"]
+                balance_field = api["balance_field"]
 
+                try:
+                    r = requests.get(url, timeout=15)
+                    r.raise_for_status()
+                    data = r.json()
+                except Exception:
+                    continue
+
+                raw_balance = extract_field(data, balance_field)
+                if raw_balance is None and balance_field != "balance":
+                    raw_balance = data.get("balance")
+
+                new_balance = parse_balance(raw_balance)
+                if new_balance is None:
+                    continue
+
+                info = state.get(api_id, {})
+                old_balance = info.get("last_balance")
+
+                if old_balance is None:
+                    state[api_id] = {
+                        "last_balance": new_balance,
+                        "last_change": datetime.utcnow().isoformat() + "Z",
+                    }
+                else:
+                    old_balance = float(old_balance)
+                    if abs(new_balance - old_balance) > 1e-9:
+                        diff = new_balance - old_balance
+                        change_type = "CỘNG TIỀN" if diff > 0 else "THANH TOÁN"
+                        prefix_emoji = "🟢" if diff > 0 else "🔴"
+
+                        msg = (
+                            f"{prefix_emoji} <b>{change_type}</b> tại <b>{api['name']}</b>\n"
+                            f"Số dư cũ: <code>{old_balance}</code>\n"
+                            f"Biến động: <code>{diff:+}</code>\n"
+                            f"Số dư mới: <b><code>{new_balance}</code></b>\n"
+                            f"Thời gian (UTC): <code>{datetime.utcnow().isoformat()}Z</code>"
+                        )
+                        send_telegram_message(bots, chat_id, msg)
+
+                        state[api_id] = {
+                            "last_balance": new_balance,
+                            "last_change": datetime.utcnow().isoformat() + "Z",
+                        }
+
+            save_state(state)
+        except Exception:
+            pass
+
+        time.sleep(POLL_INTERVAL)
+
+def start_watcher():
+    t = threading.Thread(target=watcher_loop, daemon=True)
+    t.start()
+
+# ---------------------- Auth ----------------------
+def is_logged_in():
+    return session.get("logged_in") is True
+
+@app.before_request
+def require_login():
+    # cho phép login + health không cần pass
+    if request.endpoint in ("login", "health", "static"):
+        return
+    if not is_logged_in():
+        return redirect(url_for("login"))
+
+# ---------------------- Routes ----------------------
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        password = request.form.get("password", "")
+        if password == ADMIN_PASSWORD:
+            session["logged_in"] = True
+            flash("Đăng nhập thành công. Chào mừng Admin Văn Linh đến vũ trụ giám sát số dư.", "ok")
+            return redirect(url_for("dashboard"))
+        else:
+            flash("Sai mật khẩu. Vui lòng thử lại.", "error")
+    return render_template_string(LOGIN_TEMPLATE)
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    flash("Đã đăng xuất.", "ok")
+    return redirect(url_for("login"))
+
+@app.route("/")
+def dashboard():
+    cfg = load_config()
+    st_raw = load_state()
+
+    class Obj(dict):
+        __getattr__ = dict.get
+        __setattr__ = dict.__setitem__
+
+    config = Obj()
+    config.telegram_chat_id = cfg.get("telegram_chat_id", "")
+    config.telegram_bots = cfg.get("telegram_bots", [])
+    apis = []
+    for api in cfg.get("apis", []):
+        api_obj = Obj(api)
+        api_obj.id_str = str(api_obj.id)
+        apis.append(api_obj)
+    config.apis = apis
+
+    state = {}
+    for k, v in st_raw.items():
+        o = Obj(v)
+        state[str(k)] = o
+
+    return render_template_string(
+        DASHBOARD_TEMPLATE,
+        config=config,
+        state=state,
+        watcher_running=watcher_running,
+        poll_interval=POLL_INTERVAL,
+    )
+
+@app.route("/save_telegram", methods=["POST"])
+def save_telegram():
+    cfg = load_config()
+    chat_id = (request.form.get("telegram_chat_id") or "").strip()
+    bots_raw = request.form.get("telegram_bots") or ""
+    bots = [line.strip() for line in bots_raw.splitlines() if line.strip()]
+
+    cfg["telegram_chat_id"] = chat_id
+    cfg["telegram_bots"] = bots
+    save_config(cfg)
+    flash("Đã lưu cấu hình Telegram.", "ok")
+    return redirect(url_for("dashboard"))
+
+@app.route("/add_api", methods=["POST"])
+def add_api():
+    cfg = load_config()
+    name = (request.form.get("name") or "").strip()
+    url_api = (request.form.get("url") or "").strip()
+    balance_field = (request.form.get("balance_field") or "").strip() or "balance"
+
+    if not name or not url_api:
+        flash("Thiếu tên hoặc URL API.", "error")
+        return redirect(url_for("dashboard"))
+
+    apis = cfg.get("apis", [])
+    new_id = max((int(a.get("id", 0)) for a in apis), default=0) + 1
+    apis.append(
+        {
+            "id": new_id,
+            "name": name,
+            "url": url_api,
+            "balance_field": balance_field,
+        }
+    )
+    cfg["apis"] = apis
+    save_config(cfg)
+    flash(f"Đã thêm API [{name}].", "ok")
+    return redirect(url_for("dashboard"))
+
+@app.route("/delete_api/<int:api_id>", methods=["POST"])
+def delete_api(api_id: int):
+    cfg = load_config()
+    apis = cfg.get("apis", [])
+    apis = [a for a in apis if int(a.get("id", 0)) != int(api_id)]
+    cfg["apis"] = apis
+    save_config(cfg)
+
+    st = load_state()
+    st.pop(str(api_id), None)
+    save_state(st)
+
+    flash(f"Đã xoá API ID {api_id}.", "ok")
+    return redirect(url_for("dashboard"))
+
+@app.route("/backup")
+def backup():
+    cfg = load_config()
+    st = load_state()
+    backup_data = {
+        "config": cfg,
+        "state": st,
+        "generated_at_utc": datetime.utcnow().isoformat() + "Z",
+    }
+    backup_json = json.dumps(backup_data, ensure_ascii=False, indent=2)
+    return Response(
+        backup_json,
+        mimetype="application/json",
+        headers={"Content-Disposition": 'attachment; filename="balance_watcher_backup.json"'},
+    )
+
+@app.context_processor
+def inject_title():
+    return {"title": APP_TITLE}
+
+@app.route("/health")
+def health():
+    return {"status": "ok", "watcher_running": watcher_running}
+
+# khởi động watcher khi app load
+start_watcher()
 
 if __name__ == "__main__":
-    port = int(os.environ.get('PORT', 8080))
-    print(f"Khởi chạy web server (test local) tại http://0.0.0.0:{port}")
-    app.run(host='0.0.0.0', port=port)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
