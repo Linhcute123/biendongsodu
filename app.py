@@ -282,7 +282,7 @@ HTML_TEMPLATE = """
                         <div>
                             <h3 class="text-lg font-medium text-gray-300 mb-2">Restore từ Backup (Import)</h3>
                             <form action="{{ url_for('import_json') }}" method="POST" enctype="multipart/form-data" 
-                                  onsubmit="return confirm('BẠN CÓ CHẮC CHẮN MUỐN GHI ĐÈ TOÀN BỘ DỮ LIỆU HIỆN TẠI BẰNG FILE NÀY KHÔNG?');">
+                                  onsubmit="return confirm('BẠN CÓ CHẮC CHẮN MUỐN GHI ĐÈ TOÀN BỘ DỮ LIỆN HIỆN TẠI BẰNG FILE NÀY KHÔNG?');">
                                 <input type="file" name="backup_file" accept=".json" required class="block w-full text-sm text-gray-400
                                   file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-semibold
                                   file:bg-gray-700 file:text-cyan-400 hover:file:bg-gray-600 mb-2 transition-colors"/>
@@ -308,6 +308,7 @@ HTML_TEMPLATE = """
                                     <th class="px-5 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Ngưỡng</th>
                                     
                                     <th class="px-5 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Số Dư Cuối</th>
+                                    
                                     <th class="px-5 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Trạng Thái</th>
                                     <th class="px-5 py-3 text-right text-xs font-semibold text-gray-400 uppercase tracking-wider">Xóa</th>
                                 </tr>
@@ -524,7 +525,7 @@ def check_balances():
                 new_status = f"Lỗi API: {data.get('msg', 'Lỗi không xác định')}"
 
             if new_status == "OK":
-                print(f"Kiểm tra {web_name}: Thành công. Saldo: {new_balance:,.0f}đ")
+                print(f"Kiểm tra {web_name}: Thành công. Số dư: {new_balance:,.0f}đ")
                 if old_balance is not None:
                     if new_balance < old_balance:
                         diff = old_balance - new_balance
