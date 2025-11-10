@@ -7,15 +7,10 @@ services:
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python app.py"
 
-# 'disks' phải nằm ở cấp cao nhất (không thụt lề)
-disks:
-  - name: data
-    mountPath: /data
-    sizeGB: 1
 
 # 'envVars' cũng phải nằm ở cấp cao nhất
 envVars:
   - key: PYTHON_VERSION
     value: 3.10
-  - key: SECRET_PATH
+  - key: admin
     fromAdmin: true
