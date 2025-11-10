@@ -1,5 +1,4 @@
 Flask
 requests
-sqlite3
 typing
 tenacity
