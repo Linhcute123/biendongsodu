@@ -7,12 +7,12 @@ services:
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python app.py"
     
-    # --- SỬA LỖI ---
-    # 'disks' và 'envVars' phải được thụt lề vào trong,
-    # ngang hàng với 'name', 'env', 'startCommand'...
-    
+    # 'disks' và 'envVars' phải ngang hàng với 'name', 'env', v.v.
     disks:
       - name: data
+        # --- SỬA LỖI Ở ĐÂY ---
+        # 'mountPath' và 'sizeGB' phải thụt vào
+        # so với dòng '- name: data'
         mountPath: /data
         sizeGB: 1
         
@@ -20,6 +20,4 @@ services:
       - key: PYTHON_VERSION
         value: 3.10
       - key: admin
-        # 'fromAdmin: true' sẽ khiến Render HỎI BẠN
-        # nhập đường dẫn bí mật lúc deploy.
         fromAdmin: true
