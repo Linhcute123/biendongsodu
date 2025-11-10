@@ -1,13 +1,24 @@
 services:
   - type: web
-    name: biendongsodu
+    name: saldo-bot
     env: python
-    region: singapore
-    plan: free
+    pythonVersion: "3.11" # Bạn có thể chọn phiên bản Python mới hơn nếu muốn
+    
+    # 1. Định nghĩa ổ đĩa lưu trữ
+    disks:
+      - name: data-disk
+        mountPath: /data # Đây chính là đường dẫn '/data' trong code của bạn
+        sizeGB: 1        # 1GB là đủ cho file SQLite
+        
+    # 2. Lệnh để cài đặt các thư viện
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python app.py"
+    
+    # 3. Lệnh để chạy ứng dụng (sử dụng Gunicorn cho production)
+    startCommand: "gunicorn app:app"
+    
+    # 4. Các biến môi trường
+    # KHÔNG ĐIỀN GIÁ TRỊ VÀO ĐÂY!
+    # Hãy thêm chúng vào tab "Environment" trong Dashboard của Render.
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.10
-      - key: SECRET_PATH
-        fromAdmin: true
+      - key: admin
+      - key: adminlinhdz
