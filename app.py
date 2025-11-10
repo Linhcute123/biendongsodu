@@ -1,10 +1,9 @@
 import os
+import json
 import sqlite3
 import threading
 import time
-import json
 from datetime import datetime
-from typing import Any, Dict, List, Optional
 
 import requests
 from flask import (
@@ -15,1051 +14,769 @@ from flask import (
     url_for,
     session,
     flash,
-    send_file,
+    Response,
 )
-from functools import wraps
 
-# =========================
-# CẤU HÌNH CƠ BẢN
-# =========================
+# =======================================
+# CẤU HÌNH
+# =======================================
+APP_TITLE = "Balance Watcher Pro"
 
-APP_TITLE = "Balance Watcher Universe"
-
-# Một pass duy nhất:
-# - ADMIN_PASSWORD: dùng để login
-# - SECRET_KEY: nếu không set riêng thì dùng luôn ADMIN_PASSWORD
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "changeme")
 SECRET_KEY = os.getenv("SECRET_KEY", ADMIN_PASSWORD)
 
-# DB path (Render dùng /data cho persistent)
-DATA_DIR = "/data"
-if not os.path.isdir(DATA_DIR):
-    DATA_DIR = "."
+DATA_DIR = "/data" if os.path.isdir("/data") else "."
 DB_PATH = os.path.join(DATA_DIR, "balance_watcher.db")
-
-# Mặc định nếu người dùng chưa nhập trong giao diện
-POLL_INTERVAL_DEFAULT = 30  # giây
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
 
 db_lock = threading.Lock()
-watcher_started = False
+watcher_thread = None
 watcher_running = False
 
-# =========================
-# HELPERS: format tiền & thời gian & trích xuất số dư
-# =========================
+# Các từ khóa có thể xuất hiện trong JSON nhiều web khác nhau
+BALANCE_KEYWORDS = [
+    "balance",
+    "so_du",
+    "sodu",
+    "sodư",
+    "amount",
+    "money",
+    "money_balance",
+    "wallet",
+    "wallet_balance",
+    "available",
+    "available_balance",
+    "current_balance",
+    "remain",
+    "remaining",
+    "remain_balance",
+    "remaining_balance",
+    "credit",
+    "fund",
+    "funds",
+]
 
-def fmt_amount(v: float) -> str:
-    """1000000.0 -> 1,000,000đ"""
-    try:
-        return f"{float(v):,.0f}đ"
-    except Exception:
-        return f"{v}đ"
 
-def fmt_time_label_utc(dt: datetime) -> str:
-    """20:40 10/11/2025 (UTC)"""
-    return dt.strftime("%H:%M %d/%m/%Y (UTC)")
+# =======================================
+# DB
+# =======================================
+def init_db():
+    with db_lock, sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
 
-def to_float(s: Optional[str], default: Optional[float] = None) -> Optional[float]:
-    """Chuyển đổi string (có thể có dấu phẩy) sang float."""
-    try:
-        if s is None:
-            return default
-        s = str(s).replace(",", "").strip()
-        return float(s)
-    except Exception:
-        return default
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                id INTEGER PRIMARY KEY,
+                poll_interval INTEGER DEFAULT 30,
+                threshold REAL DEFAULT 100000
+            )
+            """
+        )
 
-def _get_by_path(data: Any, path: str) -> Any:
-    """Truy cập giá trị lồng nhau trong dict/list bằng path (ví dụ: 'data.balance')."""
-    if not path:
-        return None
-    cur = data
-    for part in str(path).split("."):
-        if isinstance(cur, dict):
-            cur = cur.get(part)
-        elif isinstance(cur, list) and part.isdigit():
-            try:
-                cur = cur[int(part)]
-            except IndexError:
-                return None
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                api_url TEXT NOT NULL,
+                last_balance REAL,
+                chat_id TEXT NOT NULL,
+                bot_token TEXT NOT NULL
+            )
+            """
+        )
+
+        c.execute("SELECT id FROM settings WHERE id=1")
+        if not c.fetchone():
+            c.execute(
+                "INSERT INTO settings (id, poll_interval, threshold) VALUES (1, 30, 100000)"
+            )
+
+        conn.commit()
+
+
+def get_settings():
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT poll_interval, threshold FROM settings WHERE id=1")
+        row = c.fetchone()
+        if not row:
+            return 30, 100000
+        return int(row[0]), float(row[1])
+
+
+def update_settings(poll_interval: int, threshold: float):
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            "UPDATE settings SET poll_interval=?, threshold=? WHERE id=1",
+            (poll_interval, threshold),
+        )
+        conn.commit()
+
+
+def get_all_sites():
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT id, name, api_url, last_balance, chat_id, bot_token FROM sites"
+        )
+        return c.fetchall()
+
+
+def get_site(site_id: int):
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT id, name, api_url, last_balance, chat_id, bot_token "
+            "FROM sites WHERE id=?",
+            (site_id,),
+        )
+        return c.fetchone()
+
+
+def upsert_site(site_id, name, api_url, chat_id, bot_token):
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        if site_id:
+            c.execute(
+                """
+                UPDATE sites
+                SET name=?, api_url=?, chat_id=?, bot_token=?
+                WHERE id=?
+                """,
+                (name, api_url, chat_id, bot_token, site_id),
+            )
         else:
-            return None
-        if cur is None:
-            return None
-    return cur
+            c.execute(
+                """
+                INSERT INTO sites (name, api_url, chat_id, bot_token)
+                VALUES (?,?,?,?)
+                """,
+                (name, api_url, chat_id, bot_token),
+            )
+        conn.commit()
 
-def extract_balance(json_data: Dict[str, Any], balance_field: str) -> Optional[float]:
-    """Trích xuất số dư từ JSON, sử dụng balance_field hoặc tự động tìm."""
-    if balance_field:
-        value = _get_by_path(json_data, balance_field)
-        return to_float(value)
 
-    common_paths = [
-        "balance", "data.balance", "user.balance", "profile.balance", 
-        "result.balance", "wallet.balance", "amount", "data.amount", 
-        "data.money", "money",
-    ]
-    for path in common_paths:
-        value = _get_by_path(json_data, path)
-        if value is not None:
-            float_value = to_float(value)
-            if float_value is not None:
-                return float_value
-    
+def delete_site(site_id: int):
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM sites WHERE id=?", (site_id,))
+        conn.commit()
+
+
+def update_last_balance(site_id: int, balance: float):
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("UPDATE sites SET last_balance=? WHERE id=?", (balance, site_id))
+        conn.commit()
+
+
+# =======================================
+# TELEGRAM + FORMAT
+# =======================================
+def send_telegram_message(msg: str, chat_id: str, bot_token: str):
+    if not chat_id or not bot_token:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        requests.post(
+            url,
+            data={
+                "chat_id": chat_id,
+                "text": msg,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": True,
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        print("Telegram error:", e)
+
+
+def format_ts():
+    # HH:MM DD/MM/YYYY
+    return datetime.now().strftime("%H:%M %d/%m/%Y")
+
+
+def fmt_money(v: float) -> str:
+    return f"{v:,.0f}đ"
+
+
+# =======================================
+# TÌM SỐ DƯ TRONG JSON TỔNG QUÁT
+# =======================================
+def try_parse_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
+def find_balance_in_obj(obj):
+    """
+    Quét đệ quy toàn bộ JSON:
+    - Nếu key chứa từ khóa BALANCE_KEYWORDS và value là số/chuỗi số -> trả về.
+    - Nếu không, tiếp tục đi sâu vào dict/list.
+    """
+    # dict
+    if isinstance(obj, dict):
+        # Ưu tiên key match trực tiếp
+        for k, v in obj.items():
+            key_lower = str(k).lower()
+            if any(kw in key_lower for kw in BALANCE_KEYWORDS):
+                fv = try_parse_float(v)
+                if fv is not None:
+                    return fv
+
+        # Nếu chưa thấy, duyệt sâu
+        for v in obj.values():
+            found = find_balance_in_obj(v)
+            if found is not None:
+                return found
+
+    # list
+    elif isinstance(obj, list):
+        for item in obj:
+            found = find_balance_in_obj(item)
+            if found is not None:
+                return found
+
+    # cái khác bỏ qua
     return None
 
-# =========================
-# TEMPLATES (Giữ nguyên)
-# =========================
 
-LOGIN_TEMPLATE = r"""
-<!DOCTYPE html>
-<html lang="vi">
-<head>
-    <meta charset="UTF-8">
-    <title>Đăng nhập | {{ title }}</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        body {
-            background-color: #020817;
-            background-image:
-                radial-gradient(circle at 0 0, rgba(129, 140, 248, 0.18), transparent 55%),
-                radial-gradient(circle at 100% 0, rgba(45, 212, 191, 0.10), transparent 55%),
-                radial-gradient(circle at 100% 100%, rgba(236, 72, 153, 0.10), transparent 55%);
-            min-height: 100vh;
-            font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
-        }
-    </style>
-</head>
-<body class="flex items-center justify-center">
-    <div class="max-w-md w-full mx-4">
-        <div class="bg-slate-900/80 border border-slate-700/80 rounded-3xl shadow-2xl p-8 backdrop-blur-xl relative overflow-hidden">
-            <div class="absolute -top-10 -right-10 w-32 h-32 bg-indigo-500/20 rounded-full blur-3xl"></div>
-            <div class="absolute -bottom-16 -left-10 w-40 h-40 bg-fuchsia-500/10 rounded-full blur-3xl"></div>
+def get_balance_from_api(url: str):
+    """
+    Hỗ trợ nhiều dạng JSON thực tế:
+    - { "balance": 12345 }
+    - { "data": { "so_du": "12345" } }
+    - { "wallet": { "available_balance": 12345 } }
+    - { "money": { "current": 12345 } }
+    - { "result": { "funds": { "remain": "12345.0" } } }
+    v.v...
+    Chỉ cần ở đâu đó có key chứa từ khóa trong BALANCE_KEYWORDS.
+    """
+    try:
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
 
-            <div class="flex items-center gap-3 mb-2 relative z-10">
-                <div class="w-8 h-8 rounded-full bg-gradient-to-tr from-indigo-400 via-sky-400 to-fuchsia-400 flex items-center justify-center text-white text-xl shadow-lg">
-                    ∞
-                </div>
-                <div>
-                    <div class="text-xs uppercase tracking-[0.18em] text-slate-400">Quantum Security Gate</div>
-                    <div class="text-sm text-slate-500 flex items-center gap-2">
-                        Bot được bảo dưỡng & phát triển bởi
-                        <span class="font-semibold text-cyan-400">Admin Văn Linh</span>
-                        <span class="w-4 h-4 rounded-full bg-gradient-to-tr from-sky-400 to-blue-600 flex items-center justify-center text-[10px] text-white shadow-lg">✓</span>
-                    </div>
-                </div>
-            </div>
+        balance = find_balance_in_obj(data)
+        if balance is None:
+            print("Không tìm được trường số dư hợp lệ trong JSON:", data)
+            return None
+        return float(balance)
+    except Exception as e:
+        print("Lỗi lấy số dư:", e)
+        return None
 
-            <h1 class="mt-4 text-2xl font-semibold text-slate-50 tracking-tight">
-                Đăng nhập bảng điều khiển số dư
-            </h1>
-            <p class="mt-1 text-sm text-slate-400">
-                Nhập mật khẩu quản trị để truy cập Balance Watcher Universe.
-            </p>
 
-            {% with messages = get_flashed_messages(with_categories=true) %}
-              {% if messages %}
-                <div class="mt-4 space-y-2">
-                  {% for category, message in messages %}
-                    <div class="px-3 py-2 rounded-2xl text-xs
-                        {% if category == 'error' %}bg-red-900/60 text-red-200 border border-red-500/40
-                        {% else %}bg-emerald-900/40 text-emerald-200 border border-emerald-500/30{% endif %}">
-                      {{ message | safe }}
-                    </div>
-                  {% endfor %}
-                </div>
-              {% endif %}
-            {% endwith %}
+# =======================================
+# WORKER THEO DÕI
+# =======================================
+def watcher_loop():
+    global watcher_running
+    print("[Watcher] Started")
+    watcher_running = True
 
-            <form method="post" class="mt-5 space-y-3 relative z-10">
-                <label class="block text-xs font-medium text-slate-400 mb-1">
-                    Mật khẩu Admin
-                </label>
-                <input
-                    type="password"
-                    name="password"
-                    required
-                    placeholder="ADMIN_PASSWORD trên Render"
-                    class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-slate-100 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-400 placeholder-slate-500 shadow-inner"
-                />
-                <button
-                    type="submit"
-                    class="w-full mt-2 inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-gradient-to-r from-indigo-500 via-sky-500 to-fuchsia-500 text-white text-sm font-medium shadow-xl hover:shadow-2xl hover:-translate-y-0.5 transition-all"
-                >
-                    🚀 Vào Dashboard Vũ Trụ
-                </button>
-            </form>
-        </div>
-    </div>
-</body>
-</html>
-"""
+    while watcher_running:
+        poll_interval, threshold = get_settings()
+        sites = get_all_sites()
 
-DASHBOARD_TEMPLATE = r"""
-<!DOCTYPE html>
-<html lang="vi">
-<head>
-    <meta charset="UTF-8">
-    <title>{{ title }} | Dashboard</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        body { 
-            font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
-            background-color: #020817;
-            background-image:
-                radial-gradient(circle at 0 0, rgba(129, 140, 248, 0.18), transparent 55%),
-                radial-gradient(circle at 100% 0, rgba(45, 212, 191, 0.10), transparent 55%),
-                radial-gradient(circle at 100% 100%, rgba(236, 72, 153, 0.10), transparent 55%);
-            min-height: 100vh;
-        }
-        .scrollbar-thin::-webkit-scrollbar { height:5px; width:5px; }
-        .scrollbar-thin::-webkit-scrollbar-thumb { background-color:rgba(148,163,253,0.4); border-radius:999px; }
-        .scrollbar-thin::-webkit-scrollbar-track { background-color:transparent; }
-    </style>
-</head>
-<body class="text-slate-100">
-<div class="min-h-screen px-4 py-6 md:px-8 md:py-8">
-    {% with messages = get_flashed_messages(with_categories=true) %}
-      {% if messages %}
-        <div class="max-w-6xl mx-auto mb-4 space-y-2">
-          {% for category, message in messages %}
-            <div class="px-4 py-2 rounded-2xl text-xs border
-                {% if category == 'error' %}bg-red-900/60 text-red-200 border-red-500/40
-                {% else %}bg-emerald-900/40 text-emerald-200 border-emerald-500/30{% endif %}">
-              {{ message | safe }}
-            </div>
-          {% endfor %}
-        </div>
-      {% endif %}
-    {% endwith %}
+        for site in sites:
+            site_id, name, api_url, last_balance, chat_id, bot_token = site
 
-    <div class="max-w-6xl mx-auto mb-5 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
-        <div>
-            <div class="flex items-center gap-3">
-                <div class="w-9 h-9 rounded-full bg-gradient-to-tr from-indigo-400 via-sky-400 to-fuchsia-400 flex items-center justify-center text-white text-2xl shadow-lg">
-                    ∞
-                </div>
-                <div>
-                    <div class="text-[10px] uppercase tracking-[0.18em] text-slate-400">
-                        Balance Watcher Universe
-                    </div>
-                    <div class="flex items-center gap-2 text-[11px] text-slate-500">
-                        Bot được bảo dưỡng &amp; phát triển bởi
-                        <span class="font-semibold text-cyan-400">Admin Văn Linh</span>
-                        <span class="w-4 h-4 rounded-full bg-gradient-to-tr from-sky-400 to-blue-600 flex items-center justify-center text-[10px] text-white shadow-lg">✓</span>
-                    </div>
-                </div>
-            </div>
-            <h1 class="mt-3 text-3xl font-semibold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-indigo-300 via-sky-300 to-fuchsia-300">
-                Quantum Balance Monitor Dashboard
-            </h1>
-            <p class="mt-1 text-xs text-slate-400 max-w-xl">
-                Theo dõi biến động số dư nhiều website, phân loại tự động
-                <span class="text-emerald-400 font-semibold">CỘNG TIỀN</span> /
-                <span class="text-rose-400 font-semibold">THANH TOÁN</span> và gửi cảnh báo tức thời về Telegram.
-            </p>
-        </div>
-        <div class="flex flex-col items-start md:items-end gap-1 text-[10px] text-slate-500">
-            <div>Chu kỳ quét hiện tại:
-                <span class="text-indigo-300 font-semibold">{{ effective_poll_interval }} giây</span>
-            </div>
-            <div>Ngưỡng cảnh báo chung:
-                {% if global_threshold is not none %}
-                    <span class="text-rose-300 font-semibold">{{ "{:,.0f}".format(global_threshold|float) }}đ</span>
-                {% else %}
-                    <span class="text-slate-400">chưa đặt</span>
-                {% endif %}
-            </div>
-            <div>Trạng thái watcher:
-                {% if watcher_running %}
-                    <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-900/60 text-emerald-300 text-[10px]">
-                        <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span> Đang chạy
-                    </span>
-                {% else %}
-                    <span class="inline-flex items-center px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 text-[10px]">
-                        Tạm dừng
-                    </span>
-                {% endif %}
-            </div>
-            <div>
-                <a href="{{ url_for('logout') }}" class="text-slate-500 hover:text-fuchsia-400 transition text-[10px]">
-                    Đăng xuất
-                </a>
-            </div>
-        </div>
-    </div>
+            balance = get_balance_from_api(api_url)
+            if balance is None:
+                continue
 
-    <div class="max-w-6xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-5 items-start">
-        <div class="space-y-5">
-            <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
-                <div class="flex items-center justify-between gap-2 mb-3">
-                    <h2 class="text-sm font-semibold text-indigo-300 uppercase tracking-[0.16em]">Cài đặt chung</h2>
-                    <span class="px-2 py-0.5 rounded-full bg-slate-800/90 text-[9px] text-slate-400">
-                        Telegram: 1 Chat ID, nhiều Bot Token
-                    </span>
-                </div>
-                <form method="post" action="{{ url_for('save_settings') }}" class="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    <div class="md:col-span-2">
-                        <label class="block text-[10px] text-slate-400 mb-1">TELEGRAM_CHAT_ID (nhận cảnh báo)</label>
-                        <input type="text" name="default_chat_id"
-                            value="{{ settings.default_chat_id or '' }}"
-                            placeholder="VD: 123456789 hoặc -100123456789"
-                            class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-400">
-                    </div>
+            # Biến động tăng / giảm
+            if last_balance is not None:
+                diff = balance - last_balance
 
-                    <div>
-                        <label class="block text-[10px] text-slate-400 mb-1">Bot mặc định để gửi (tuỳ chọn)</label>
-                        <select name="default_bot_id"
-                            class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-400">
-                            <option value="">-- Gửi bằng TẤT CẢ bot --</option>
-                            {% for bot in bots %}
-                                <option value="{{ bot.id }}" {% if settings.default_bot_id and settings.default_bot_id == bot.id|string %}selected{% endif %}>
-                                    {{ bot.bot_name }} (..{{ bot.bot_token[-6:] }})
-                                </option>
-                            {% endfor %}
-                        </select>
-                    </div>
+                # Thanh toán / trừ tiền
+                if diff < -1e-6:
+                    msg = (
+                        f"🔻 *THANH TOÁN TẠI {name}*\n\n"
+                        f"💳 Nội dung: Thanh toán / trừ số dư\n"
+                        f"➖ Biến động: *-{fmt_money(abs(diff))}*\n"
+                        f"💰 Số dư cuối: *{fmt_money(balance)}*\n"
+                        f"🕒 {format_ts()}"
+                    )
+                    send_telegram_message(msg, chat_id, bot_token)
 
-                    <div>
-                        <label class="block text-[10px] text-slate-400 mb-1">Chu kỳ quét (giây)</label>
-                        <input type="text" name="poll_interval"
-                            value="{{ settings.poll_interval or '' }}"
-                            placeholder="VD: 15, 30, 60..."
-                            class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-400">
-                    </div>
+                # Nhận tiền / nạp tiền
+                elif diff > 1e-6:
+                    msg = (
+                        f"💰 *NHẬN TIỀN TẠI {name}*\n\n"
+                        f"📥 Nội dung: Nạp tiền vào tài khoản\n"
+                        f"➕ Biến động: *+{fmt_money(diff)}*\n"
+                        f"💰 Số dư cuối: *{fmt_money(balance)}*\n"
+                        f"🕒 {format_ts()}"
+                    )
+                    send_telegram_message(msg, chat_id, bot_token)
 
-                    <div>
-                        <label class="block text-[10px] text-slate-400 mb-1">Ngưỡng cảnh báo chung (VND)</label>
-                        <input type="text" name="global_threshold"
-                            value="{{ settings.global_threshold or '' }}"
-                            placeholder="VD: 1,000,000 (bỏ trống nếu không cảnh báo)"
-                            class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-rose-500 focus:border-rose-400">
-                    </div>
+            # Cảnh báo số dư thấp: chỉ khi vừa rơi từ trên ngưỡng xuống dưới
+            if balance < threshold and (last_balance is None or last_balance >= threshold):
+                warn = (
+                    f"⚠️ *CẢNH BÁO SỐ DƯ THẤP - {name}*\n\n"
+                    f"🔥 Số dư hiện tại: *{fmt_money(balance)}*\n"
+                    f"❗ Ngưỡng cảnh báo chung: *{fmt_money(threshold)}*\n"
+                    f"👉 Vui lòng nạp thêm để tránh gián đoạn dịch vụ.\n"
+                    f"🕒 {format_ts()}"
+                )
+                send_telegram_message(warn, chat_id, bot_token)
 
-                    <div class="md:col-span-2">
-                        <button type="submit"
-                            class="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-gradient-to-r from-indigo-500 via-sky-500 to-fuchsia-500 text-white text-[11px] font-medium shadow-lg hover:-translate-y-0.5 hover:shadow-xl transition-all">
-                            💾 Lưu cấu hình
-                        </button>
-                    </div>
-                </form>
-            </div>
+            update_last_balance(site_id, balance)
 
-            <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
-                <div class="flex items-center justify-between mb-3">
-                    <h2 class="text-sm font-semibold text-cyan-300 uppercase tracking-[0.16em]">Quản lý Bot Telegram</h2>
-                </div>
-                <form method="post" action="{{ url_for('add_bot') }}" class="space-y-3 mb-4">
-                    <div>
-                        <label class="block text-[10px] text-slate-400 mb-1">Tên bot (hiển thị)</label>
-                        <input type="text" name="bot_name" required
-                            placeholder="VD: Bot Cảnh báo chính"
-                            class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:border-cyan-400">
-                    </div>
-                    <div>
-                        <label class="block text-[10px] text-slate-400 mb-1">Token bot</label>
-                        <input type="text" name="bot_token" required
-                            placeholder="123456:ABC-DEF..."
-                            class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:border-cyan-400">
-                    </div>
+        time.sleep(max(poll_interval, 5))
+
+    print("[Watcher] Stopped")
+
+
+# =======================================
+# AUTH
+# =======================================
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        pw = request.form.get("password", "")
+        if pw == ADMIN_PASSWORD:
+            session["logged_in"] = True
+            return redirect(url_for("dashboard"))
+        flash("Sai mật khẩu!", "danger")
+
+    return render_template_string(
+        """
+        <html>
+        <head><title>Đăng nhập - {{title}}</title></head>
+        <body style="font-family:Arial;background:#111;color:#eee;">
+            <div style="width:320px;margin:100px auto;padding:24px;border-radius:10px;background:#1d1d1d;">
+                <h2 style="margin-top:0;text-align:center;">🔐 {{title}}</h2>
+                <form method="POST">
+                    <input type="password" name="password" placeholder="Mật khẩu admin"
+                           style="width:100%;padding:10px;border-radius:6px;border:1px solid #444;background:#111;color:#eee;"
+                           required>
                     <button type="submit"
-                        class="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-500 text-white text-[11px] font-medium shadow-lg hover:-translate-y-0.5 hover:shadow-xl transition-all">
-                        ➕ Thêm Bot
+                            style="margin-top:14px;width:100%;padding:10px;border:none;border-radius:6px;background:#0d6efd;color:#fff;font-weight:bold;cursor:pointer;">
+                        Đăng nhập
                     </button>
                 </form>
-                <div class="space-y-2 max-h-40 overflow-y-auto scrollbar-thin">
-                    {% for bot in bots %}
-                    <div class="flex items-center justify-between px-3 py-2 rounded-2xl bg-slate-950/70 border border-slate-800 text-[10px]">
-                        <div class="flex flex-col">
-                            <span class="text-slate-100 font-medium">{{ bot.bot_name }}</span>
-                            <span class="text-slate-500 text-[9px]">...{{ bot.bot_token[-12:] }}</span>
-                        </div>
-                        <div class="flex items-center gap-2">
-                            <form method="post" action="{{ url_for('test_bot') }}">
-                                <input type="hidden" name="bot_id" value="{{ bot.id }}">
-                                <button class="px-2 py-1 rounded-xl bg-slate-800 text-cyan-300 hover:bg-cyan-600/20 hover:text-cyan-200 text-[9px]">
-                                    Test
-                                </button>
-                            </form>
-                            <form method="post" action="{{ url_for('delete_bot') }}"
-                                    onsubmit="return confirm('Xoá bot {{ bot.bot_name }}?');">
-                                <input type="hidden" name="bot_id" value="{{ bot.id }}">
-                                <button class="px-2 py-1 rounded-xl bg-slate-900 text-rose-400 hover:bg-rose-600/20 hover:text-rose-300 text-[9px]">
-                                    Xoá
-                                </button>
-                            </form>
-                        </div>
-                    </div>
-                    {% else %}
-                    <div class="text-[9px] text-slate-500">
-                        Chưa có bot nào. Thêm ít nhất 1 bot để bắt đầu gửi cảnh báo.
-                    </div>
-                    {% endfor %}
-                </div>
             </div>
+        </body>
+        </html>
+        """,
+        title=APP_TITLE,
+    )
 
-            <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
-                <div class="flex items-center justify-between mb-3">
-                    <h2 class="text-sm font-semibold text-fuchsia-300 uppercase tracking-[0.16em]">Backup dữ liệu</h2>
-                </div>
-                <p class="text-[10px] text-slate-400 mb-3">
-                    Tải xuống toàn bộ cấu hình (bots, API, trạng thái số dư cuối) để lưu trữ an toàn hoặc chuyển server.
-                </p>
-                <a href="{{ url_for('download_backup') }}"
-                   class="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-slate-800 text-slate-100 text-[11px] border border-slate-600 hover:bg-slate-700 hover:border-fuchsia-500/60 hover:text-fuchsia-200 transition-all">
-                    📦 Tải file backup (.db)
-                </a>
-            </div>
-        </div>
-
-        <div class="lg:col-span-2 space-y-5">
-            <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
-                <div class="flex items-center justify-between gap-2 mb-3">
-                    <h2 class="text-sm font-semibold text-sky-300 uppercase tracking-[0.16em]">Thêm API số dư</h2>
-                    <span class="px-2 py-0.5 rounded-full bg-slate-800/90 text-[9px] text-slate-400">
-                        Hỗ trợ nhiều website khác nhau
-                    </span>
-                </div>
-                <form method="post" action="{{ url_for('add_api') }}" class="grid grid-cols-1 md:grid-cols-2 gap-3 text-[10px]">
-                    <div>
-                        <label class="block text-slate-400 mb-1">Tên hiển thị</label>
-                        <input type="text" name="name" required
-                            placeholder="VD: ShopAccMMO chính"
-                            class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-sky-400">
-                    </div>
-                    <div>
-                        <label class="block text-slate-400 mb-1">URL API kiểm tra số dư</label>
-                        <input type="text" name="url" required
-                            placeholder="https://.../api/profile.php?api_key=XXXX"
-                            class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-sky-400">
-                    </div>
-                    <div>
-                        <label class="block text-slate-400 mb-1">Trường số dư trong JSON</label>
-                        <input type="text" name="balance_field"
-                            placeholder="Để trống = auto detect (balance / data.balance / ...)"
-                            class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-sky-400">
-                    </div>
-                    <div class="flex items-end">
-                        <button type="submit"
-                            class="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-gradient-to-r from-sky-500 to-indigo-500 text-white text-[11px] font-medium shadow-lg hover:-translate-y-0.5 hover:shadow-xl transition-all">
-                            ➕ Thêm API
-                        </button>
-                    </div>
-                </form>
-            </div>
-
-            <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
-                <div class="flex items-center justify-between mb-3">
-                    <h2 class="text-sm font-semibold text-indigo-300 uppercase tracking-[0.16em]">Danh sách API đang theo dõi</h2>
-                    <span class="text-[9px] text-slate-500">
-                        Lần chạy gần nhất: <span class="text-sky-300">{{ last_run or 'chưa có' }}</span>
-                    </span>
-                </div>
-                <div class="overflow-x-auto scrollbar-thin">
-                    <table class="min-w-full text-[10px]">
-                        <thead class="bg-slate-950/80">
-                            <tr>
-                                <th class="px-3 py-2 text-left text-slate-400 uppercase tracking-[0.14em]">ID</th>
-                                <th class="px-3 py-2 text-left text-slate-400 uppercase tracking-[0.14em]">Tên</th>
-                                <th class="px-3 py-2 text-left text-slate-400 uppercase tracking-[0.14em]">URL</th>
-                                <th class="px-3 py-2 text-left text-slate-400 uppercase tracking-[0.14em]">Trường</th>
-                                <th class="px-3 py-2 text-left text-slate-400 uppercase tracking-[0.14em]">Số dư gần nhất</th>
-                                <th class="px-3 py-2 text-left text-slate-400 uppercase tracking-[0.14em]">Cập nhật</th>
-                                <th class="px-3 py-2 text-right text-slate-400 uppercase tracking-[0.14em]"></th>
-                            </tr>
-                        </thead>
-                        <tbody class="divide-y divide-slate-800">
-                            {% for api in apis %}
-                            <tr class="hover:bg-slate-800/80 transition-colors">
-                                <td class="px-3 py-2 text-slate-400">#{{ api.id }}</td>
-                                <td class="px-3 py-2 text-slate-100 font-medium">{{ api.name }}</td>
-                                <td class="px-3 py-2 text-slate-500 max-w-[220px] truncate">{{ api.url }}</td>
-                                <td class="px-3 py-2 text-slate-400">{{ api.balance_field or 'auto' }}</td>
-                                <td class="px-3 py-2">
-                                    {% if api.last_balance is not none %}
-                                        <span class="inline-flex px-2 py-0.5 rounded-full bg-emerald-900/40 text-emerald-300">
-                                            {{ "{:,.0f}".format(api.last_balance|float) }}đ
-                                        </span>
-                                    {% else %}
-                                        <span class="inline-flex px-2 py-0.5 rounded-full bg-slate-800 text-slate-400">
-                                            chưa có
-                                        </span>
-                                    {% endif %}
-                                </td>
-                                <td class="px-3 py-2 text-slate-500">
-                                    {{ api.last_change or '-' }}
-                                </td>
-                                <td class="px-3 py-2 text-right">
-                                    <form method="post" action="{{ url_for('delete_api', api_id=api.id) }}"
-                                            onsubmit="return confirm('Xoá API {{ api.name }} khỏi danh sách theo dõi?');">
-                                        <button class="px-2 py-1 rounded-xl bg-slate-950 text-rose-400 hover:bg-rose-600/20 hover:text-rose-300">
-                                            ✖
-                                        </button>
-                                    </form>
-                                </td>
-                            </tr>
-                            {% else %}
-                            <tr>
-                                <td colspan="7" class="px-3 py-4 text-center text-slate-500 text-[10px]">
-                                    Chưa có API nào. Thêm ít nhất một API để bắt đầu giám sát.
-                                </td>
-                            </tr>
-                            {% endfor %}
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
-    </div>
-</div>
-</body>
-</html>
-"""
-
-# =========================
-# DB HELPER
-# =========================
-
-def init_db():
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS telegram_bots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            bot_name TEXT NOT NULL,
-            bot_token TEXT NOT NULL UNIQUE
-        )
-        """)
-
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-        """)
-
-        # Khởi tạo key mặc định nếu chưa có
-        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('default_chat_id', '')")
-        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('default_bot_id', '')")
-        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('last_run', '')")
-        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('poll_interval', '')")
-        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('global_threshold', '')")
-
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS apis (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            url TEXT NOT NULL UNIQUE,
-            balance_field TEXT NOT NULL,
-            last_balance REAL,
-            last_change TEXT
-        )
-        """)
-
-        conn.commit()
-        conn.close()
-
-def get_settings() -> Dict[str, Optional[str]]:
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT key, value FROM settings")
-        rows = c.fetchall()
-        conn.close()
-    return {k: (v if v is not None else "") for k, v in rows}
-
-def set_setting(key: str, value: str):
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO settings (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value),
-        )
-        conn.commit()
-        conn.close()
-
-def get_bots() -> List[Dict[str, Any]]:
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM telegram_bots ORDER BY id")
-        rows = c.fetchall()
-        conn.close()
-    return [dict(r) for r in rows]
-
-def get_apis() -> List[Dict[str, Any]]:
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM apis ORDER BY id")
-        rows = c.fetchall()
-        conn.close()
-    return [dict(r) for r in rows]
-
-def add_bot_db(name: str, token: str):
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("INSERT INTO telegram_bots (bot_name, bot_token) VALUES (?, ?)", (name, token))
-        conn.commit()
-        conn.close()
-
-def delete_bot_db(bot_id: int):
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("DELETE FROM telegram_bots WHERE id=?", (bot_id,))
-        conn.commit()
-        conn.close()
-
-def add_api_db(name: str, url: str, balance_field: str):
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO apis (name, url, balance_field, last_balance, last_change) "
-            "VALUES (?, ?, ?, NULL, NULL)",
-            (name, url, balance_field or ""),
-        )
-        conn.commit()
-        conn.close()
-
-def delete_api_db(api_id: int):
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("DELETE FROM apis WHERE id=?", (api_id,))
-        conn.commit()
-        conn.close()
-
-def update_api_state(api_id: int, balance: float, changed_at: str):
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute(
-            "UPDATE apis SET last_balance=?, last_change=? WHERE id=?",
-            (balance, changed_at, api_id),
-        )
-        conn.commit()
-        conn.close()
-
-
-# =========================
-# TELEGRAM NOTIFIER
-# =========================
-
-def send_telegram_message(token: str, chat_id: str, message: str) -> bool:
-    """Gửi tin nhắn Telegram và trả về True nếu thành công."""
-    if not token or not chat_id or not message:
-        return False
-
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": "True",
-    }
-    
-    try:
-        response = requests.post(url, data=payload, timeout=10)
-        response.raise_for_status()
-        return response.json().get('ok', False)
-    except requests.exceptions.RequestException as e:
-        print(f"Lỗi gửi Telegram (Bot ...{token[-6:]}): {e}")
-        return False
-
-def notify_change(api: Dict[str, Any], new_balance: float, settings: Dict[str, Optional[str]], bots: List[Dict[str, Any]]):
-    """Gửi thông báo khi số dư thay đổi đáng kể."""
-    old_balance = api.get('last_balance', 0.0) or 0.0
-    change = new_balance - old_balance
-    
-    global_threshold = to_float(settings.get('global_threshold')) or 0.0
-    
-    if abs(change) < global_threshold:
-        return
-
-    if not settings.get('default_chat_id') or not bots:
-        print("Bỏ qua cảnh báo: Thiếu Chat ID hoặc Bot Token.")
-        return
-
-    chat_id = settings['default_chat_id']
-    
-    if change > 0:
-        change_type = "💰 CỘNG TIỀN (Deposit)"
-        change_color = "🟢"
-        emoji = "✨"
-    else:
-        change_type = "💸 THANH TOÁN (Payment/Withdraw)"
-        change_color = "🔴"
-        emoji = "⚠️"
-
-    message = f"""{emoji} <b>BALANCE WATCHER ALERT</b> {emoji}
----
-<b>Trang web:</b> <code>{api['name']}</code>
-<b>Phân loại:</b> {change_type}
-
-<b>Biến động:</b> {change_color} <b>{fmt_amount(change)}</b>
-<b>Số dư cũ:</b> {fmt_amount(old_balance)}
-<b>Số dư mới:</b> {fmt_amount(new_balance)}
-
-<b>Thời gian (UTC):</b> {fmt_time_label_utc(datetime.utcnow())}
-"""
-    
-    bots_to_send = []
-    if settings.get('default_bot_id'):
-        default_bot = next((b for b in bots if b['id'] == int(settings['default_bot_id'])), None)
-        if default_bot:
-            bots_to_send.append(default_bot)
-        else:
-            bots_to_send = bots
-    else:
-        bots_to_send = bots
-        
-    for bot in bots_to_send:
-        success = send_telegram_message(bot['bot_token'], chat_id, message)
-        if not success:
-            print(f"Lỗi gửi cảnh báo bằng bot: {bot['bot_name']}")
-
-# =========================
-# WATCHER CORE LOGIC
-# =========================
-
-def check_balances():
-    """Kiểm tra số dư tất cả API và cập nhật/cảnh báo."""
-    settings = get_settings()
-    apis = get_apis()
-    bots = get_bots()
-    
-    run_time = datetime.utcnow().strftime("%H:%M:%S %d/%m")
-    set_setting('last_run', run_time)
-    
-    global_threshold_val = settings.get('global_threshold') or '0'
-    print(f"[{run_time}] Bắt đầu chu kỳ quét ({len(apis)} API) - Threshold: {global_threshold_val}đ")
-
-    for api in apis:
-        try:
-            # 1. Gọi API
-            response = requests.get(api['url'], timeout=15)
-            response.raise_for_status()
-            json_data = response.json()
-
-            # 2. Trích xuất số dư
-            new_balance = extract_balance(json_data, api['balance_field'])
-
-            if new_balance is None:
-                continue
-            
-            new_balance = float(new_balance)
-            
-            # 3. So sánh và Cảnh báo
-            old_balance = api.get('last_balance')
-            
-            if old_balance is not None:
-                old_balance = float(old_balance)
-                if abs(new_balance - old_balance) > 0.01:
-                    notify_change(api, new_balance, settings, bots)
-            
-            # 4. Cập nhật DB
-            update_api_state(api['id'], new_balance, fmt_time_label_utc(datetime.utcnow()))
-
-        except requests.exceptions.RequestException as e:
-            print(f"❌ Lỗi HTTP/Network khi quét {api['name']}: {e}")
-        except json.JSONDecodeError:
-            print(f"❌ Lỗi JSON response từ {api['name']}")
-        except Exception as e:
-            print(f"❌ Lỗi không xác định khi xử lý {api['name']}: {e}")
-
-    print(f"[{run_time}] Hoàn thành chu kỳ quét.")
-
-
-def watcher_thread():
-    """Luồng chạy nền của watcher."""
-    global watcher_running
-    print("Watcher thread started.")
-    watcher_running = True
-    
-    while watcher_running:
-        settings = get_settings()
-        poll_interval = to_float(settings.get('poll_interval'))
-        if not poll_interval or poll_interval < 5:
-            poll_interval = POLL_INTERVAL_DEFAULT
-            
-        check_balances()
-        
-        print(f"Tạm dừng {int(poll_interval)} giây...")
-        time.sleep(poll_interval)
-    
-    print("Watcher thread stopped.")
-
-
-def start_watcher():
-    """Bắt đầu luồng watcher nếu chưa chạy."""
-    global watcher_started
-    if not watcher_started:
-        thread = threading.Thread(target=watcher_thread)
-        thread.daemon = True
-        thread.start()
-        watcher_started = True
-
-# =========================
-# FLASK ROUTES
-# =========================
-
-def login_required(f):
-    """Decorator kiểm tra đăng nhập."""
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if session.get("logged_in") != True:
-            flash("Vui lòng đăng nhập để truy cập Dashboard.", "error")
-            return redirect(url_for("login"))
-        return f(*args, **kwargs)
-    return decorated_function
-
-@app.route("/", methods=["GET", "POST"])
-def login():
-    """Route Đăng nhập."""
-    if session.get("logged_in"):
-        return redirect(url_for("dashboard"))
-
-    if request.method == "POST":
-        password = request.form.get("password")
-        if password == ADMIN_PASSWORD:
-            session["logged_in"] = True
-            flash("Đăng nhập thành công! Chào mừng trở lại vũ trụ.", "success")
-            # Chỉ khởi động watcher ở đây nếu đang ở môi trường phát triển (debug)
-            if os.environ.get("FLASK_ENV") == "development":
-                start_watcher()
-            return redirect(url_for("dashboard"))
-        else:
-            flash("Mật khẩu quản trị không chính xác.", "error")
-
-    return render_template_string(LOGIN_TEMPLATE, title=APP_TITLE)
 
 @app.route("/logout")
 def logout():
-    """Route Đăng xuất."""
-    session.pop("logged_in", None)
-    flash("Bạn đã đăng xuất.", "success")
+    session.clear()
     return redirect(url_for("login"))
 
 
-@app.route("/dashboard")
-@login_required
-def dashboard():
-    """Route Dashboard chính."""
-    settings = get_settings()
-    bots = get_bots()
-    apis = get_apis()
+def require_login():
+    return bool(session.get("logged_in"))
 
-    poll_interval_db = to_float(settings.get('poll_interval'))
-    effective_poll_interval = int(poll_interval_db) if poll_interval_db and poll_interval_db >= 5 else POLL_INTERVAL_DEFAULT
-    
-    global_threshold_val = to_float(settings.get('global_threshold'))
+
+# =======================================
+# DASHBOARD + CONFIG + SITES
+# =======================================
+@app.route("/")
+def root():
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/dashboard")
+def dashboard():
+    if not require_login():
+        return redirect(url_for("login"))
+
+    poll_interval, threshold = get_settings()
+    sites = get_all_sites()
+    global watcher_running
 
     return render_template_string(
-        DASHBOARD_TEMPLATE,
+        """
+        <html>
+        <head><title>{{title}}</title></head>
+        <body style="font-family:Arial;background:#0f0f10;color:#f5f5f5;">
+            <div style="max-width:1000px;margin:20px auto;">
+                <h1>{{title}}</h1>
+                <p>Trạng thái watcher:
+                    {% if watcher_running %}
+                        ✅ Đang chạy
+                    {% else %}
+                        ⏹ Đang dừng
+                    {% endif %}
+                </p>
+
+                <h3>⚙️ Cấu hình chung</h3>
+                <form method="POST" action="{{url_for('update_config')}}">
+                    <label>Chu kỳ quét (giây):</label><br>
+                    <input type="number" name="poll_interval" value="{{poll_interval}}" min="5"
+                           style="padding:6px;border-radius:4px;border:1px solid #444;background:#111;color:#eee;" required><br><br>
+
+                    <label>Ngưỡng cảnh báo số dư thấp (đ, áp dụng chung):</label><br>
+                    <input type="number" name="threshold" value="{{threshold}}" min="0"
+                           style="padding:6px;border-radius:4px;border:1px solid #444;background:#111;color:#eee;" required><br><br>
+
+                    <button type="submit"
+                            style="padding:8px 16px;border:none;border-radius:4px;background:#0d6efd;color:#fff;cursor:pointer;font-weight:bold;">
+                        💾 Lưu cấu hình
+                    </button>
+                </form>
+
+                <p style="margin-top:15px;">
+                    {% if not watcher_running %}
+                        <a href="{{url_for('start_watcher')}}" style="margin-right:10px;">▶️ Bắt đầu theo dõi</a>
+                    {% else %}
+                        <a href="{{url_for('stop_watcher')}}" style="margin-right:10px;">⏹ Dừng theo dõi</a>
+                    {% endif %}
+                    <a href="{{url_for('backup')}}" style="margin-right:10px;">🧩 Backup JSON</a>
+                    <a href="{{url_for('restore')}}" style="margin-right:10px;">♻️ Restore</a>
+                    <a href="{{url_for('logout')}}">🚪 Đăng xuất</a>
+                </p>
+
+                <hr style="border-color:#333;">
+
+                <h3>🌐 Danh sách website theo dõi</h3>
+                <table width="100%" cellspacing="0" cellpadding="6"
+                       style="border-collapse:collapse;font-size:14px;">
+                    <tr style="background:#181818;">
+                        <th align="left">Tên</th>
+                        <th align="left">API URL</th>
+                        <th align="left">Số dư cache</th>
+                        <th align="left">Chat ID</th>
+                        <th align="left">Thao tác</th>
+                    </tr>
+                    {% for s in sites %}
+                    <tr style="border-top:1px solid #222;">
+                        <td>{{s[1]}}</td>
+                        <td style="font-size:11px;color:#aaa;">{{s[2]}}</td>
+                        <td>{% if s[3] is not none %}{{"{:,.0f}".format(s[3])}}đ{% else %}-{% endif %}</td>
+                        <td style="font-size:11px;color:#aaa;">{{s[4]}}</td>
+                        <td>
+                            <a href="{{url_for('edit_site', site_id=s[0])}}">✏️ Sửa</a> |
+                            <a href="{{url_for('delete_site_route', site_id=s[0])}}" onclick="return confirm('Xoá site này?');">🗑 Xoá</a>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </table>
+
+                <p style="margin-top:10px;">
+                    <a href="{{url_for('edit_site', site_id=0)}}">➕ Thêm website mới</a>
+                </p>
+
+                {% with messages = get_flashed_messages(with_categories=true) %}
+                  {% if messages %}
+                    <div style="margin-top:20px;">
+                      {% for category, msg in messages %}
+                        <div style="padding:8px 10px;border-radius:4px;margin-bottom:6px;
+                                    background:#222;color:#fff;border-left:4px solid
+                                    {% if category == 'success' %}#28a745{% elif category == 'danger' %}#dc3545{% else %}#0d6efd{% endif %};">
+                            {{msg}}
+                        </div>
+                      {% endfor %}
+                    </div>
+                  {% endif %}
+                {% endwith %}
+            </div>
+        </body>
+        </html>
+        """,
         title=APP_TITLE,
-        settings=settings,
-        bots=bots,
-        apis=apis,
+        poll_interval=poll_interval,
+        threshold=int(threshold),
+        sites=sites,
         watcher_running=watcher_running,
-        effective_poll_interval=effective_poll_interval,
-        last_run=settings.get('last_run', 'chưa có'),
-        global_threshold=global_threshold_val,
     )
 
-@app.route("/save_settings", methods=["POST"])
-@login_required
-def save_settings():
-    """Lưu cấu hình chung."""
-    default_chat_id = request.form.get("default_chat_id", "").strip()
-    default_bot_id = request.form.get("default_bot_id", "").strip()
-    poll_interval = request.form.get("poll_interval", "").strip()
-    global_threshold = request.form.get("global_threshold", "").strip()
+
+@app.route("/config", methods=["POST"])
+def update_config():
+    if not require_login():
+        return redirect(url_for("login"))
 
     try:
-        if poll_interval:
-            interval_sec = to_float(poll_interval)
-            if interval_sec is None or interval_sec < 5:
-                 flash("Chu kỳ quét tối thiểu là **5 giây** và phải là số hợp lệ.", "error")
-                 return redirect(url_for("dashboard"))
-            poll_interval = str(int(interval_sec))
-        
-        if global_threshold:
-            global_threshold = global_threshold.replace(",", "")
-            if to_float(global_threshold) is None:
-                flash("Ngưỡng cảnh báo không hợp lệ. Vui lòng nhập số (ví dụ: 1000000).", "error")
-                return redirect(url_for("dashboard"))
-
-        set_setting('default_chat_id', default_chat_id)
-        set_setting('default_bot_id', default_bot_id)
-        set_setting('poll_interval', poll_interval)
-        set_setting('global_threshold', global_threshold)
-        
-        flash("💾 Cấu hình chung đã được lưu thành công! **Watcher sẽ áp dụng chu kỳ quét mới sau lần chạy hiện tại.**", "success")
-        
+        poll_interval = int(request.form.get("poll_interval", "30"))
+        threshold = float(request.form.get("threshold", "100000"))
+        if poll_interval < 5:
+            poll_interval = 5
+        update_settings(poll_interval, threshold)
+        flash("Đã lưu cấu hình chung.", "success")
     except Exception as e:
-        flash(f"Lỗi khi lưu cấu hình: {e}", "error")
+        print(e)
+        flash("Lỗi lưu cấu hình.", "danger")
 
     return redirect(url_for("dashboard"))
 
 
-@app.route("/add_bot", methods=["POST"])
-@login_required
-def add_bot():
-    """Thêm bot Telegram mới."""
-    bot_name = request.form.get("bot_name", "").strip()
-    bot_token = request.form.get("bot_token", "").strip()
+@app.route("/site/edit/<int:site_id>", methods=["GET", "POST"])
+def edit_site(site_id):
+    if not require_login():
+        return redirect(url_for("login"))
 
-    if not bot_name or not bot_token:
-        flash("Tên bot và Token bot không được để trống.", "error")
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        api_url = request.form.get("api_url", "").strip()
+        chat_id = request.form.get("chat_id", "").strip()
+        bot_token = request.form.get("bot_token", "").strip()
+
+        if not (name and api_url and chat_id and bot_token):
+            flash("Vui lòng nhập đầy đủ thông tin.", "danger")
+            return redirect(request.url)
+
+        upsert_site(site_id if site_id != 0 else None, name, api_url, chat_id, bot_token)
+        flash("Đã lưu website.", "success")
         return redirect(url_for("dashboard"))
-        
-    try:
-        add_bot_db(bot_name, bot_token)
-        flash(f"➕ Bot '<b>{bot_name}</b>' đã được thêm thành công!", "success")
-    except sqlite3.IntegrityError:
-        flash("Bot Token này đã tồn tại trong hệ thống.", "error")
-    except Exception as e:
-        flash(f"Lỗi khi thêm bot: {e}", "error")
 
+    site = get_site(site_id) if site_id != 0 else None
+
+    return render_template_string(
+        """
+        <html>
+        <head><title>{{ 'Sửa' if site else 'Thêm' }} site - {{title}}</title></head>
+        <body style="font-family:Arial;background:#0f0f10;color:#f5f5f5;">
+            <div style="max-width:600px;margin:30px auto;">
+                <h2>{{ 'Sửa website' if site else 'Thêm website mới' }}</h2>
+                <form method="POST">
+                    <label>Tên hiển thị:</label><br>
+                    <input type="text" name="name" value="{{site[1] if site else ''}}" required
+                           style="width:100%;padding:8px;border-radius:4px;border:1px solid:#444;background:#111;color:#eee;"><br><br>
+
+                    <label>API URL trả về JSON số dư:</label><br>
+                    <input type="text" name="api_url" value="{{site[2] if site else ''}}" required
+                           style="width:100%;padding:8px;border-radius:4px;border:1px solid:#444;background:#111;color:#eee;"><br><br>
+
+                    <label>Telegram Chat ID:</label><br>
+                    <input type="text" name="chat_id" value="{{site[4] if site else ''}}" required
+                           style="width:100%;padding:8px;border-radius:4px;border:1px solid:#444;background:#111;color:#eee;"><br><br>
+
+                    <label>Telegram Bot Token:</label><br>
+                    <input type="text" name="bot_token" value="{{site[5] if site else ''}}" required
+                           style="width:100%;padding:8px;border-radius:4px;border:1px solid:#444;background:#111;color:#eee;"><br><br>
+
+                    <button type="submit"
+                            style="padding:8px 16px;border:none;border-radius:4px;background:#0d6efd;color:#fff;cursor:pointer;font-weight:bold;">
+                        💾 Lưu
+                    </button>
+                    <a href="{{url_for('dashboard')}}" style="margin-left:10px;color:#ccc;">Hủy</a>
+                </form>
+            </div>
+        </body>
+        </html>
+        """,
+        title=APP_TITLE,
+        site=site,
+    )
+
+
+@app.route("/site/delete/<int:site_id>")
+def delete_site_route(site_id):
+    if not require_login():
+        return redirect(url_for("login"))
+    delete_site(site_id)
+    flash("Đã xoá website.", "info")
     return redirect(url_for("dashboard"))
 
 
-@app.route("/delete_bot", methods=["POST"])
-@login_required
-def delete_bot():
-    """Xóa bot Telegram."""
-    bot_id = request.form.get("bot_id", type=int)
-    
-    if bot_id:
-        delete_bot_db(bot_id)
-        
-        settings = get_settings()
-        if settings.get('default_bot_id') == str(bot_id):
-            set_setting('default_bot_id', '')
-            
-        flash("✖ Bot đã được xoá thành công.", "success")
-    else:
-        flash("ID bot không hợp lệ.", "error")
-        
-    return redirect(url_for("dashboard"))
-
-@app.route("/test_bot", methods=["POST"])
-@login_required
-def test_bot():
-    """Thử nghiệm gửi tin nhắn bằng bot cụ thể."""
-    bot_id = request.form.get("bot_id", type=int)
-    settings = get_settings()
-    
-    if not settings.get('default_chat_id'):
-        flash("🚨 Thiếu **Chat ID mặc định**. Vui lòng thiết lập Chat ID trước khi Test.", "error")
-        return redirect(url_for("dashboard"))
-
-    bots = get_bots()
-    test_bot = next((b for b in bots if b['id'] == bot_id), None)
-
-    if not test_bot:
-        flash("Bot không tồn tại.", "error")
-        return redirect(url_for("dashboard"))
-
-    message = f"✅ <b>[TEST]</b> Bot <code>{test_bot['bot_name']}</code> đang hoạt động! Tin nhắn gửi từ Balance Watcher Universe."
-    success = send_telegram_message(test_bot['bot_token'], settings['default_chat_id'], message)
-    
-    if success:
-        flash(f"🎉 Gửi tin nhắn TEST thành công bằng bot: <b>{test_bot['bot_name']}</b>", "success")
-    else:
-        flash(f"❌ Lỗi gửi tin nhắn TEST bằng bot: <b>{test_bot['bot_name']}</b>. Kiểm tra lại **Token và Chat ID**.", "error")
-        
-    return redirect(url_for("dashboard"))
+# =======================================
+# BACKUP / RESTORE JSON
+# =======================================
+def export_backup_json():
+    poll_interval, threshold = get_settings()
+    sites = get_all_sites()
+    data = {
+        "settings": {
+            "poll_interval": poll_interval,
+            "threshold": threshold,
+        },
+        "sites": [
+            {
+                "name": s[1],
+                "api_url": s[2],
+                "last_balance": s[3],
+                "chat_id": s[4],
+                "bot_token": s[5],
+            }
+            for s in sites
+        ],
+        "version": 1,
+    }
+    return data
 
 
-@app.route("/add_api", methods=["POST"])
-@login_required
-def add_api():
-    """Thêm API số dư mới."""
-    name = request.form.get("name", "").strip()
-    url = request.form.get("url", "").strip()
-    balance_field = request.form.get("balance_field", "").strip()
+def import_backup_json(data: dict):
+    if not isinstance(data, dict):
+        raise ValueError("Backup JSON không hợp lệ")
 
-    if not name or not url:
-        flash("Tên hiển thị và URL API không được để trống.", "error")
-        return redirect(url_for("dashboard"))
+    settings = data.get("settings", {})
+    sites = data.get("sites", [])
 
-    try:
-        if not url.startswith(("http://", "https://")):
-            flash("URL API không hợp lệ (phải bắt đầu bằng **http://** hoặc **https://**).", "error")
+    poll_interval = int(settings.get("poll_interval", 30))
+    threshold = float(settings.get("threshold", 100000))
+
+    with db_lock, sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+
+        # cập nhật settings
+        c.execute(
+            "UPDATE settings SET poll_interval=?, threshold=? WHERE id=1",
+            (poll_interval, threshold),
+        )
+
+        # xoá hết sites cũ
+        c.execute("DELETE FROM sites")
+
+        # thêm sites mới
+        for s in sites:
+            name = s.get("name")
+            api_url = s.get("api_url")
+            chat_id = s.get("chat_id")
+            bot_token = s.get("bot_token")
+            last_balance = s.get("last_balance", None)
+
+            if not (name and api_url and chat_id and bot_token):
+                continue
+
+            c.execute(
+                """
+                INSERT INTO sites (name, api_url, last_balance, chat_id, bot_token)
+                VALUES (?,?,?,?,?)
+                """,
+                (name, api_url, last_balance, chat_id, bot_token),
+            )
+
+        conn.commit()
+
+
+@app.route("/backup")
+def backup():
+    if not require_login():
+        return redirect(url_for("login"))
+
+    data = export_backup_json()
+    content = json.dumps(data, ensure_ascii=False, indent=2)
+    return Response(
+        content,
+        mimetype="application/json",
+        headers={"Content-Disposition": "attachment; filename=balance_watcher_backup.json"},
+    )
+
+
+@app.route("/restore", methods=["GET", "POST"])
+def restore():
+    if not require_login():
+        return redirect(url_for("login"))
+
+    if request.method == "POST":
+        raw = None
+
+        file = request.files.get("file")
+        if file and file.filename:
+            raw = file.read().decode("utf-8", errors="ignore")
+        else:
+            raw = request.form.get("json_data", "").strip()
+
+        if not raw:
+            flash("Vui lòng chọn file hoặc dán nội dung JSON.", "danger")
+            return redirect(url_for("restore"))
+
+        try:
+            data = json.loads(raw)
+            import_backup_json(data)
+            flash("Khôi phục dữ liệu từ backup thành công.", "success")
             return redirect(url_for("dashboard"))
+        except Exception as e:
+            print("Restore error:", e)
+            flash("Backup JSON không hợp lệ.", "danger")
+            return redirect(url_for("restore"))
 
-        add_api_db(name, url, balance_field)
-        flash(f"➕ API '<b>{name}</b>' đã được thêm vào danh sách theo dõi!", "success")
-    except sqlite3.IntegrityError:
-        flash("URL API này đã tồn tại trong hệ thống.", "error")
-    except Exception as e:
-        flash(f"Lỗi khi thêm API: {e}", "error")
+    # GET: form restore
+    return render_template_string(
+        """
+        <html>
+        <head><title>Restore - {{title}}</title></head>
+        <body style="font-family:Arial;background:#0f0f10;color:#f5f5f5;">
+            <div style="max-width:700px;margin:30px auto;">
+                <h2>♻️ Restore từ file backup JSON</h2>
+                <p>Dữ liệu hiện tại sẽ bị ghi đè bằng dữ liệu trong file JSON.</p>
+                <form method="POST" enctype="multipart/form-data">
+                    <p><b>Chọn file JSON:</b></p>
+                    <input type="file" name="file" accept="application/json"
+                           style="color:#fff;"><br><br>
 
+                    <p><b>Hoặc dán nội dung JSON:</b></p>
+                    <textarea name="json_data" rows="10"
+                              style="width:100%;padding:8px;border-radius:4px;border:1px solid:#444;background:#111;color:#eee;"></textarea><br><br>
+
+                    <button type="submit"
+                            style="padding:8px 16px;border:none;border-radius:4px;background:#dc3545;color:#fff;cursor:pointer;font-weight:bold;"
+                            onclick="return confirm('Xác nhận ghi đè dữ liệu từ backup?');">
+                        ♻️ Thực hiện restore
+                    </button>
+                    <a href="{{url_for('dashboard')}}" style="margin-left:10px;color:#ccc;">Hủy</a>
+                </form>
+
+                {% with messages = get_flashed_messages(with_categories=true) %}
+                  {% if messages %}
+                    <div style="margin-top:20px;">
+                      {% for category, msg in messages %}
+                        <div style="padding:8px 10px;border-radius:4px;margin-bottom:6px;
+                                    background:#222;color:#fff;border-left:4px solid
+                                    {% if category == 'success' %}#28a745{% elif category == 'danger' %}#dc3545{% else %}#0d6efd{% endif %};">
+                            {{msg}}
+                        </div>
+                      {% endfor %}
+                    </div>
+                  {% endif %}
+                {% endwith %}
+            </div>
+        </body>
+        </html>
+        """,
+        title=APP_TITLE,
+    )
+
+
+# =======================================
+# START / STOP WATCHER
+# =======================================
+@app.route("/start")
+def start_watcher():
+    if not require_login():
+        return redirect(url_for("login"))
+
+    global watcher_thread, watcher_running
+    if not watcher_running:
+        watcher_thread = threading.Thread(target=watcher_loop, daemon=True)
+        watcher_thread.start()
+        flash("Đã bắt đầu theo dõi số dư.", "success")
+    else:
+        flash("Watcher đang chạy rồi.", "info")
     return redirect(url_for("dashboard"))
 
 
-@app.route("/delete_api/<int:api_id>", methods=["POST"])
-@login_required
-def delete_api(api_id: int):
-    """Xóa API số dư."""
-    try:
-        delete_api_db(api_id)
-        flash("✖ API đã được xoá khỏi danh sách theo dõi.", "success")
-    except Exception as e:
-        flash(f"Lỗi khi xoá API: {e}", "error")
-        
+@app.route("/stop")
+def stop_watcher():
+    if not require_login():
+        return redirect(url_for("login"))
+
+    global watcher_running
+    watcher_running = False
+    flash("Đã yêu cầu dừng watcher.", "info")
     return redirect(url_for("dashboard"))
 
 
-@app.route("/download_backup")
-@login_required
-def download_backup():
-    """Tải xuống file backup DB (chỉ hỗ trợ file sqlite3)."""
-    try:
-        if not os.path.exists(DB_PATH):
-             flash("Lỗi: File cơ sở dữ liệu không tồn tại.", "error")
-             return redirect(url_for("dashboard"))
-             
-        return send_file(DB_PATH, as_attachment=True, download_name="balance_watcher_backup.db")
-    except Exception as e:
-        flash(f"Lỗi khi tạo file backup: {e}", "error")
-        return redirect(url_for("dashboard"))
-
-
-# =========================
-# KHỞI TẠO VÀ CHẠY (PHẦN ĐÃ SỬA LỖI)
-# =========================
-
-# SỬA LỖI: Luôn gọi init_db() để đảm bảo các bảng tồn tại ngay cả khi 
-# Gunicorn/WSGI server đang tải ứng dụng.
-init_db() 
-
-# Logic khởi động Watcher Thread
-if os.environ.get("FLASK_ENV") != "development":
-    # Khởi động watcher ngay cho môi trường production (như Render)
-    start_watcher()
-    print("Watcher Thread được tự động khởi động (Production mode).")
-else:
-    # Trong môi trường dev, watcher sẽ được khởi động sau khi login thành công.
-    print("Watcher Thread sẽ được khởi động khi Admin đăng nhập lần đầu (Development mode).")
-
-
+# =======================================
+# MAIN
+# =======================================
 if __name__ == "__main__":
-    print("Khởi động ứng dụng Flask (Dev Server)...")
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)), debug=os.environ.get("FLASK_ENV") == "development")
+    init_db()
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
