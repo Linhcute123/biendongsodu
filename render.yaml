@@ -13,7 +13,7 @@ services:
     # Biến môi trường
     envVars:
       - key: PYTHON_VERSION
-        value: "3.11"
+        value: "3.11.9"
       - key: adminlinhdz
         # Bạn nên vào tab "Environment" trên Render để đặt giá trị này
         value: "adminlinhdz"
