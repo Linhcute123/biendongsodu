@@ -5,7 +5,7 @@ import threading
 import sys
 import json
 import io
-import functools # Cần cho decorator đăng nhập
+import functools 
 
 from flask import (
     Flask, render_template_string, request, redirect, url_for, 
@@ -16,21 +16,25 @@ from urllib.parse import urlparse
 from werkzeug.utils import secure_filename
 
 # --- Cấu hình ---
-# 1. KEY BÍ MẬT (DÙNG ĐỂ ĐĂNG NHẬP VÀ LÀM SECRET KEY)
-# Lấy từ biến môi trường của Render
+# 1. KEY BÍ MẬT VÀ SECRET KEY
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD')
 if not ADMIN_PASSWORD:
     print("CẢNH BÁO: ADMIN_PASSWORD chưa được đặt. Đặt thành 'admin' cho mục đích test.", file=sys.stderr)
     ADMIN_PASSWORD = 'admin'
 
-# Dùng chung một key cho cả hai việc
+FLASK_SECRET_KEY = os.environ.get('FLASK_SECRET_KEY', ADMIN_PASSWORD) 
+# ADMIN_PASSWORD chỉ dùng cho logic đăng nhập. FLASK_SECRET_KEY dùng cho session.
+
 app = Flask(__name__)
-app.secret_key = ADMIN_PASSWORD # Dùng ADMIN_PASSWORD làm SECRET_KEY
+app.secret_key = FLASK_SECRET_KEY # Dùng key riêng cho Flask
 
-
-# --- Cấu hình CSDL (Render Free Tier) ---
-# Luôn lưu CSDL ở thư mục gốc của dự án
-DATABASE_FILE = 'accounts.db'
+# --- Cấu hình CSDL (Render Persistent Disk) ---
+# Sử dụng thư mục /data là Mount Path của Persistent Disk trong render.yaml
+DATA_DIR = os.environ.get('RENDER_DISK_PATH', 'data')
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    
+DATABASE_FILE = os.path.join(DATA_DIR, 'accounts.db')
 print(f"Sử dụng CSDL tại: {DATABASE_FILE}")
 
 
@@ -65,19 +69,19 @@ HTML_LOGIN = """
         }
         /* Style cho vòng tròn tích xanh chuyên nghiệp */
         .verified-badge {
-            display: inline-flex; /* Quan trọng: Xếp hàng cùng văn bản */
+            display: inline-flex;
             align-items: center;
             justify-content: center;
             flex-shrink: 0;
-            width: 20px;    /* Kích thước badge */
+            width: 20px;
             height: 20px;
             border-radius: 50%;
-            background-color: #3b82f6; /* Màu xanh (blue-500) */
-            color: white;      /* Màu dấu tick */
+            background-color: #3b82f6; 
+            color: white;
             font-weight: bold;
             font-size: 12px;
-            margin-left: 6px;  /* Khoảng cách nhỏ với chữ "Linh" */
-            vertical-align: middle; /* Căn giữa theo chiều dọc với văn bản */
+            margin-left: 6px;
+            vertical-align: middle;
         }
     </style>
 </head>
@@ -134,6 +138,11 @@ HTML_TEMPLATE = """
             background-image: radial-gradient(circle at 1px 1px, rgba(200, 200, 255, 0.1) 1px, transparent 0);
             background-size: 20px 20px;
         }
+        /* Tùy chỉnh thanh cuộn chuyên nghiệp */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #1f2937; }
+        ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #6b7280; }
     </style>
 </head>
 <body class="text-gray-200 min-h-screen">
@@ -516,13 +525,14 @@ def check_balances():
             r = requests.get(full_api_url, timeout=10)
             data = r.json()
             
+            # Logic lấy số dư: Cố gắng lấy từ 'data' hoặc trực tiếp từ root, dùng key 'balance' hoặc 'sodu'
             if data.get('status') == True or data.get('success') == True:
                 user_data = data.get('data', data)
-                new_balance = user_data.get('balance', user_data.get('sodu'))
-                if new_balance is None:
+                new_balance_str = user_data.get('balance', user_data.get('sodu'))
+                if new_balance_str is None:
                     new_status = "Lỗi: Không tìm thấy 'balance' hoặc 'sodu' trong API."
                 else:
-                    new_balance = float(new_balance)
+                    new_balance = float(new_balance_str)
                     new_status = "OK"
             else:
                 new_status = f"Lỗi API: {data.get('msg', 'Lỗi không xác định')}"
@@ -530,22 +540,28 @@ def check_balances():
             if new_status == "OK":
                 print(f"Kiểm tra {web_name}: Thành công. Số dư: {new_balance:,.0f}đ")
                 if old_balance is not None:
-                    if new_balance < old_balance:
-                        diff = old_balance - new_balance
-                        msg = (f"✅ GIAO DỊCH THÀNH CÔNG ({web_name})\n\n"
-                               f"Nội dung: Thanh toán đơn hàng\n"
-                               f"Tổng trừ (Gồm phí): *-{diff:,.0f}đ*\n"
-                               f"Số dư cuối: *{new_balance:,.0f}đ*")
-                        send_telegram_message(msg, chat_id_to_use, bot_token_to_use)
-                    elif new_balance > old_balance:
-                        diff = new_balance - old_balance
-                        msg = (f"💰 NHẬN TIỀN THÀNH CÔNG ({web_name})\n\n"
-                               f"Nội dung: Nạp tiền vào tài khoản\n"
-                               f"Biến động: *+{diff:,.0f}đ*\n"
-                               f"Số dư cuối: *{new_balance:,.0f}đ*")
-                        send_telegram_message(msg, chat_id_to_use, bot_token_to_use)
+                    if abs(new_balance - old_balance) >= 1: # Kiểm tra biến động đáng kể
+                        if new_balance < old_balance:
+                            diff = old_balance - new_balance
+                            msg = (f"✅ GIAO DỊCH THÀNH CÔNG ({web_name})\n\n"
+                                   f"Nội dung: Thanh toán đơn hàng\n"
+                                   f"Tổng trừ (Gồm phí): *-{diff:,.0f}đ*\n"
+                                   f"Số dư cuối: *{new_balance:,.0f}đ*")
+                            send_telegram_message(msg, chat_id_to_use, bot_token_to_use)
+                        elif new_balance > old_balance:
+                            diff = new_balance - old_balance
+                            msg = (f"💰 NHẬN TIỀN THÀNH CÔNG ({web_name})\n\n"
+                                   f"Nội dung: Nạp tiền vào tài khoản\n"
+                                   f"Biến động: *+{diff:,.0f}đ*\n"
+                                   f"Số dư cuối: *{new_balance:,.0f}đ*")
+                            send_telegram_message(msg, chat_id_to_use, bot_token_to_use)
                 
-                if new_balance < threshold:
+                # Cảnh báo ngưỡng: Chỉ gửi nếu số dư mới thấp hơn ngưỡng VÀ số dư cũ cao hơn ngưỡng.
+                # Điều này tránh spam thông báo mỗi lần quét khi đã dưới ngưỡng.
+                is_below_threshold = new_balance < threshold
+                was_above_threshold = old_balance is None or old_balance >= threshold
+                
+                if is_below_threshold and was_above_threshold:
                     msg = (f"🔥 SỐ DƯ SẮP HẾT ({web_name}) 🔥\n\n"
                            f"Tài khoản chỉ còn *{new_balance:,.0f}đ* (Dưới ngưỡng *{threshold:,.0f}đ*).\n"
                            f"👉 Vui lòng nạp tiền GẤP!")
@@ -553,7 +569,8 @@ def check_balances():
 
             else: 
                 print(f"Lỗi API từ {web_name}: {new_status}", file=sys.stderr)
-                if acc['last_status'] == 'OK' or acc['last_status'] is None: 
+                # Chỉ gửi thông báo nếu trạng thái trước đó là OK hoặc chưa từng quét
+                if acc['last_status'] == 'OK' or acc['last_status'] == 'Mới' or acc['last_status'] is None: 
                     msg = (f"❌ LỖI API ({web_name})\n\n"
                            f"Không thể kiểm tra số dư. Server báo:\n"
                            f"`{new_status}`\n\n"
@@ -577,16 +594,15 @@ def check_balances():
     conn.close()
     print("Hoàn tất phiên kiểm tra.")
 
-# --- Ứng dụng Web Flask ---
+# --- Ứng dụng Web Flask (Các route không thay đổi) ---
+# ... (Giữ nguyên các route từ login_page đến delete_account và các hàm JSON) ...
 
-# Trang Đăng Nhập
 @app.route('/')
 def login_page():
     if 'authenticated' in session:
         return redirect(url_for('dashboard'))
     return render_template_string(HTML_LOGIN)
 
-# Xử lý đăng nhập
 @app.route('/login', methods=['POST'])
 def login_handler():
     secret_key = request.form.get('secret_key')
@@ -597,14 +613,12 @@ def login_handler():
         flash('Secret Key không chính xác!', 'error')
         return redirect(url_for('login_page'))
 
-# Đăng xuất
 @app.route('/logout')
 def logout():
     session.pop('authenticated', None)
     flash('Bạn đã đăng xuất.', 'success')
     return redirect(url_for('login_page'))
 
-# Trang chủ (Bảng điều khiển)
 @app.route('/dashboard')
 @login_required
 def dashboard():
@@ -632,13 +646,10 @@ def dashboard():
         return render_template_string(HTML_TEMPLATE, accounts=accounts, all_bots=all_bots, settings=settings)
     except Exception as e:
         flash(f"Lỗi khi tải dữ liệu: {e}", 'error')
-        # Nếu lỗi là "no such table", hãy cố gắng tạo lại CSDL
         if 'no such table' in str(e):
             init_db()
             flash('Lỗi CSDL: Đã thử khởi tạo lại. Vui lòng F5 trang.', 'error')
         return render_template_string(HTML_TEMPLATE, accounts=[], all_bots=[], settings={})
-
-# --- Các route chức năng ---
 
 @app.route('/update_settings', methods=['POST'])
 @login_required
@@ -801,8 +812,6 @@ def delete_account():
         flash(f"Lỗi khi xóa tài khoản web: {e}", 'error')
     return redirect(url_for('dashboard'))
 
-# --- HÀM BACKUP/RESTORE JSON ---
-
 @app.route('/export_json')
 @login_required
 def export_json():
@@ -828,7 +837,6 @@ def export_json():
             "accounts": accounts
         }
         
-        # Tạo file JSON trong bộ nhớ
         json_str = json.dumps(backup_data, indent=2, ensure_ascii=False)
         json_bytes = io.BytesIO(json_str.encode('utf-8'))
         
@@ -856,39 +864,31 @@ def import_json():
         
     if file and file.filename.endswith('.json'):
         try:
-            # Đọc file JSON
             data = json.load(io.TextIOWrapper(file.stream, encoding='utf-8'))
             
-            # Tạm dừng bot
             scheduler.pause()
             
             conn = sqlite3.connect(DATABASE_FILE)
             c = conn.cursor()
 
-            # Bắt đầu 1 transaction (quan trọng)
             c.execute("BEGIN TRANSACTION")
             try:
-                # 1. Xóa dữ liệu cũ
                 c.execute("DELETE FROM accounts")
                 c.execute("DELETE FROM telegram_bots")
                 c.execute("DELETE FROM global_settings")
                 
-                # 2. Khôi phục Bảng settings
                 if 'global_settings' in data:
                     for setting in data['global_settings']:
                         c.execute("INSERT INTO global_settings (setting_key, setting_value) VALUES (?, ?)",
                                   (setting['setting_key'], setting['setting_value']))
                 
-                # 3. Khôi phục Bảng bots
                 if 'telegram_bots' in data:
                     for bot in data['telegram_bots']:
                         c.execute("INSERT INTO telegram_bots (id, bot_name, bot_token) VALUES (?, ?, ?)",
                                   (bot.get('id'), bot['bot_name'], bot['bot_token']))
                 
-                # 4. Khôi phục Bảng accounts
                 if 'accounts' in data:
                     for acc in data['accounts']:
-                        # Phải khớp với các cột trong CSDL
                         c.execute("""
                             INSERT INTO accounts (
                                 id, web_name, api_key, api_url, threshold, 
@@ -900,12 +900,11 @@ def import_json():
                             acc.get('last_status'), acc.get('bot_id')
                         ))
                 
-                # Lưu transaction
                 conn.commit()
                 flash('Restore CSDL từ file JSON thành công!', 'success')
                 
             except Exception as e:
-                conn.rollback() # Hoàn tác nếu có lỗi
+                conn.rollback() 
                 flash(f"Lỗi khi ghi dữ liệu restore: {e}", 'error')
             
         except json.JSONDecodeError:
@@ -915,25 +914,20 @@ def import_json():
         finally:
             if 'conn' in locals() and conn:
                 conn.close()
-            # Khởi động lại bot
             scheduler.resume()
     else:
         flash('File không hợp lệ. Chỉ chấp nhận file .json', 'error')
         
     return redirect(url_for('dashboard'))
 
-# --- SỬA LỖI "no such table" CỦA GUNICORN ---
-# Di chuyển 2 khối code này ra khỏi 'if __name__ == "__main__":'
-# để Gunicorn có thể chạy chúng khi khởi động.
-
-# 1. Khởi tạo CSDL ngay lập tức khi file được import
+# --- Khối chạy cuối cùng ---
 print("Đang khởi tạo CSDL...")
 init_db()
 print("Khởi tạo CSDL hoàn tất.")
 
-# 2. Khởi động Scheduler
 scheduler = BackgroundScheduler()
-scheduler.add_job(func=check_balances, trigger="interval", minutes=2)
+# Giữ nguyên 2 phút như trong code gốc của bạn
+scheduler.add_job(func=check_balances, trigger="interval", minutes=2) 
 scheduler.start()
 print(f"Trình lập lịch đã bắt đầu, kiểm tra mỗi 2 PHÚT.")
 
@@ -941,10 +935,7 @@ import atexit
 atexit.register(lambda: scheduler.shutdown())
 
 
-# 3. Khối __name__ == "__main__" chỉ còn dùng để test local
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 8080))
     print(f"Khởi chạy web server (test local) tại http://0.0.0.0:{port}")
-    print(f"Truy cập trang chủ để đăng nhập.")
-    # Không chạy scheduler.start() hay init_db() ở đây nữa
     app.run(host='0.0.0.0', port=port)
