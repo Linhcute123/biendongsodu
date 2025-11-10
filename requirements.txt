@@ -1,4 +1,4 @@
-Flask
-requests
-gunicorn
-jinja2
+Flask==3.0.3
+gunicorn==23.0.0
+requests==2.32.3
+python-dotenv==1.0.1  # Đọc .env local (tùy chọn)
