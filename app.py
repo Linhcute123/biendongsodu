@@ -112,7 +112,7 @@ def extract_balance(json_data: Dict[str, Any], balance_field: str) -> Optional[f
     return None
 
 # =========================
-# TEMPLATES (Giữ nguyên)
+# TEMPLATES (Đã cập nhật phần Backup & Restore)
 # =========================
 
 LOGIN_TEMPLATE = r"""
@@ -406,15 +406,28 @@ DASHBOARD_TEMPLATE = r"""
 
             <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
                 <div class="flex items-center justify-between mb-3">
-                    <h2 class="text-sm font-semibold text-fuchsia-300 uppercase tracking-[0.16em]">Backup dữ liệu</h2>
+                    <h2 class="text-sm font-semibold text-fuchsia-300 uppercase tracking-[0.16em]">Backup & Restore</h2>
                 </div>
                 <p class="text-[10px] text-slate-400 mb-3">
-                    Tải xuống toàn bộ cấu hình (bots, API, trạng thái số dư cuối) để lưu trữ an toàn hoặc chuyển server.
+                    Tải xuống toàn bộ cấu hình (bots, API, settings) để lưu trữ an toàn hoặc khôi phục lại.
                 </p>
-                <a href="{{ url_for('download_backup') }}"
-                   class="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-slate-800 text-slate-100 text-[11px] border border-slate-600 hover:bg-slate-700 hover:border-fuchsia-500/60 hover:text-fuchsia-200 transition-all">
-                    📦 Tải file backup (.db)
-                </a>
+                <div class="space-y-3">
+                    <a href="{{ url_for('download_backup') }}"
+                       class="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-slate-800 text-slate-100 text-[11px] border border-slate-600 hover:bg-slate-700 hover:border-fuchsia-500/60 hover:text-fuchsia-200 transition-all">
+                        📦 Tải file backup (.json)
+                    </a>
+                    
+                    <form method="post" action="{{ url_for('upload_restore') }}" enctype="multipart/form-data" 
+                        onsubmit="return confirm('⚠️ CẢNH BÁO: Thao tác này sẽ XÓA TOÀN BỘ cấu hình hiện tại và khôi phục từ file. Bạn có chắc chắn?');">
+                        <label class="block text-[10px] text-slate-400 mb-1">Upload file backup (.json)</label>
+                        <input type="file" name="backup_file" required accept=".json"
+                            class="w-full text-[11px] text-slate-400 file:mr-4 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-white file:font-medium file:bg-slate-700 hover:file:bg-indigo-600 cursor-pointer">
+                        <button type="submit"
+                            class="w-full mt-3 inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-rose-700 text-white text-[11px] font-medium shadow-lg hover:bg-rose-600 transition-all">
+                            🔄 Khôi phục từ Backup
+                        </button>
+                    </form>
+                </div>
             </div>
         </div>
 
@@ -523,7 +536,7 @@ DASHBOARD_TEMPLATE = r"""
 """
 
 # =========================
-# DB HELPER (ĐÃ SỬA LỖI #1: Đảm bảo bảng luôn tồn tại)
+# DB HELPER
 # =========================
 
 def init_db():
@@ -552,8 +565,6 @@ def init_db():
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('poll_interval', '')")
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('global_threshold', '')")
 
-        # 💡 SỬA LỖI #2: Đổi kiểu dữ liệu last_balance từ REAL sang INTEGER
-        # để lưu số dư dưới dạng số nguyên, loại bỏ lỗi dấu phẩy động.
         c.execute("""
         CREATE TABLE IF NOT EXISTS apis (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -646,10 +657,7 @@ def delete_api_db(api_id: int):
         conn.close()
 
 def update_api_state(api_id: int, balance: float, changed_at: str):
-    """
-    💡 SỬA LỖI #3: Lưu số dư dưới dạng INTEGER (số nguyên) để tránh lỗi dấu phẩy động 
-    khi so sánh trong DB.
-    """
+    """Lưu số dư dưới dạng INTEGER (số nguyên) để tránh lỗi dấu phẩy động."""
     with db_lock:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -664,6 +672,26 @@ def update_api_state(api_id: int, balance: float, changed_at: str):
         conn.commit()
         conn.close()
 
+def clear_all_data():
+    """Xóa tất cả dữ liệu trong bảng apis và telegram_bots, và reset settings."""
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        
+        # Xóa dữ liệu cũ
+        c.execute("DELETE FROM apis")
+        c.execute("DELETE FROM telegram_bots")
+        c.execute("DELETE FROM settings WHERE key NOT IN ('admin_password_hash', 'secret_key')") # Giữ lại key quan trọng nếu có
+        
+        # Reset lại các settings mặc định
+        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('default_chat_id', '')")
+        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('default_bot_id', '')")
+        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('last_run', '')")
+        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('poll_interval', '')")
+        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('global_threshold', '')")
+        
+        conn.commit()
+        conn.close()
 
 # =========================
 # TELEGRAM NOTIFIER
@@ -695,7 +723,6 @@ def notify_change(api: Dict[str, Any], change: int, new_balance: float, settings
     
     global_threshold = to_float(settings.get('global_threshold')) or 0.0
     
-    # Kiểm tra điều kiện cảnh báo (sử dụng change_int)
     if abs(change) < global_threshold:
         return
 
@@ -745,7 +772,7 @@ def notify_change(api: Dict[str, Any], change: int, new_balance: float, settings
             print(f"Lỗi gửi cảnh báo bằng bot: {bot['bot_name']}")
 
 # =========================
-# WATCHER CORE LOGIC (ĐÃ SỬA LỖI #4: Logic so sánh)
+# WATCHER CORE LOGIC
 # =========================
 
 def check_balances():
@@ -784,7 +811,6 @@ def check_balances():
                 
                 change = new_balance_int - old_balance_int
                 
-                # Biến động thực tế (số nguyên)
                 if abs(change) > 0:
                     print(f"💰 Phát hiện thay đổi trên {api['name']} ({api['last_balance']} -> {new_balance_int})")
                     # Dùng change (INT) và new_balance (FLOAT) để gửi thông báo
@@ -1047,33 +1073,101 @@ def delete_api(api_id: int):
 @app.route("/download_backup")
 @login_required
 def download_backup():
-    """Tải xuống file backup DB (chỉ hỗ trợ file sqlite3)."""
-    try:
-        if not os.path.exists(DB_PATH):
-             flash("Lỗi: File cơ sở dữ liệu không tồn tại.", "error")
-             return redirect(url_for("dashboard"))
-             
-        return send_file(DB_PATH, as_attachment=True, download_name="balance_watcher_backup.db")
-    except Exception as e:
-        flash(f"Lỗi khi tạo file backup: {e}", "error")
+    """Tải xuống file backup ở dạng JSON."""
+    
+    backup_data = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "settings": get_settings(),
+        "telegram_bots": get_bots(),
+        "apis": get_apis(),
+    }
+    
+    # Chuẩn bị phản hồi với file JSON
+    response = app.response_class(
+        response=json.dumps(backup_data, indent=4),
+        status=200,
+        mimetype='application/json'
+    )
+    response.headers.set("Content-Disposition", "attachment", filename="balance_watcher_backup.json")
+    return response
+
+@app.route("/upload_restore", methods=["POST"])
+@login_required
+def upload_restore():
+    """Khôi phục dữ liệu từ file JSON."""
+    
+    if 'backup_file' not in request.files:
+        flash("Không tìm thấy file backup.", "error")
+        return redirect(url_for("dashboard"))
+    
+    file = request.files['backup_file']
+    if file.filename == '':
+        flash("Vui lòng chọn file JSON để khôi phục.", "error")
+        return redirect(url_for("dashboard"))
+        
+    if not file.filename.lower().endswith('.json'):
+        flash("File không đúng định dạng. Vui lòng chọn file .json.", "error")
         return redirect(url_for("dashboard"))
 
+    try:
+        # Đọc nội dung file
+        data = json.load(file.stream)
+        
+        # 1. Xác thực cấu trúc cơ bản
+        if not all(k in data for k in ["settings", "telegram_bots", "apis"]):
+            flash("Cấu trúc file JSON không hợp lệ. Thiếu trường 'settings', 'telegram_bots' hoặc 'apis'.", "error")
+            return redirect(url_for("dashboard"))
+            
+        # 2. Xóa dữ liệu cũ và reset settings
+        clear_all_data()
+        
+        # 3. Khôi phục Settings
+        for key, value in data["settings"].items():
+            if key not in ['admin_password_hash', 'secret_key']: # Không ghi đè các key bảo mật
+                set_setting(key, value)
+                
+        # 4. Khôi phục Bots
+        for bot in data["telegram_bots"]:
+            try:
+                add_bot_db(bot['bot_name'], bot['bot_token'])
+            except sqlite3.IntegrityError:
+                pass # Bỏ qua bot trùng token
+
+        # 5. Khôi phục APIs
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        for api in data["apis"]:
+            try:
+                c.execute(
+                    "INSERT INTO apis (name, url, balance_field, last_balance, last_change) VALUES (?, ?, ?, ?, ?)",
+                    (api['name'], api['url'], api['balance_field'], api.get('last_balance'), api.get('last_change')),
+                )
+            except sqlite3.IntegrityError:
+                 flash(f"⚠️ Cảnh báo: API '{api['name']}' bị trùng URL và đã bị bỏ qua.", "error")
+            
+        conn.commit()
+        conn.close()
+        
+        flash("✅ Khôi phục dữ liệu thành công! Vui lòng kiểm tra lại cấu hình và trạng thái Watcher.", "success")
+        
+    except json.JSONDecodeError:
+        flash("Lỗi: File JSON không hợp lệ.", "error")
+    except Exception as e:
+        flash(f"Lỗi khôi phục không xác định: {e}", "error")
+        
+    return redirect(url_for("dashboard"))
+
 
 # =========================
-# KHỞI TẠO VÀ CHẠY (PHẦN ĐÃ SỬA LỖI ĐỂ KHẮC PHỤC LỖI GUNICORN)
+# KHỞI TẠO VÀ CHẠY
 # =========================
 
-# 💡 FIX: Luôn gọi init_db() để đảm bảo các bảng tồn tại ngay cả khi 
-# Gunicorn/WSGI server đang tải ứng dụng.
 init_db() 
 
-# Logic khởi động Watcher Thread
 if os.environ.get("FLASK_ENV") != "development":
-    # Khởi động watcher ngay cho môi trường production (như Render)
     start_watcher()
     print("Watcher Thread được tự động khởi động (Production mode).")
 else:
-    # Trong môi trường dev, watcher sẽ được khởi động sau khi login thành công.
     print("Watcher Thread sẽ được khởi động khi Admin đăng nhập lần đầu (Development mode).")
 
 
