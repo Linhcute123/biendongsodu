@@ -1,29 +1,20 @@
-# Đây là file "Blueprint" của Render.
-# Nó tự động hóa toàn bộ quá trình cài đặt.
-
 services:
-  # 1. Định nghĩa Web Service
   - type: web
     name: biendongsodu
     env: python
     region: singapore
-    plan: free # Sử dụng gói Free
-    
-    # 2. Cài đặt Build & Start
+    plan: free
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python app.py"
-
-    # 3. Thêm Đĩa Lưu Trữ (Persistent Disk)
     disks:
       - name: data
         mountPath: /data
         sizeGB: 1
-
-    # 4. Cài đặt Biến Môi Trường
     envVars:
       - key: PYTHON_VERSION
         value: 3.10
-      - key: ADMIN_PASSWORD
-        # 'fromAdmin' sẽ khiến Render HỎI BẠN mật khẩu
-        # lúc deploy, thay vì lưu nó vào code (an toàn).
+      - key: admin
+        # 'fromAdmin' sẽ khiến Render HỎI BẠN
+        # nhập đường dẫn bí mật lúc deploy.
+        # HÃY NHẬP MỘT CHUỖI KHÓ ĐOÁN!
         fromAdmin: true
