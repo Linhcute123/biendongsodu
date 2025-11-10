@@ -1,5 +1,6 @@
 services:
   - type: web
+    # 'name', 'env', v.v. thụt vào 4 dấu cách
     name: biendongsodu
     env: python
     region: singapore
@@ -7,17 +8,21 @@ services:
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python app.py"
     
-    # 'disks' và 'envVars' phải ngang hàng với 'name', 'env', v.v.
+    # LỖI 1 ĐƯỢC SỬA: 'disks' phải thụt vào 4 dấu cách,
+    # ngang hàng với 'name', 'env', 'startCommand'
     disks:
+      # '- name' thụt vào 6 dấu cách
       - name: data
-        # --- SỬA LỖI Ở ĐÂY ---
-        # 'mountPath' và 'sizeGB' phải thụt vào
-        # so với dòng '- name: data'
+        # LỖI 2 ĐƯỢC SỬA: 'mountPath' & 'sizeGB' phải thụt vào
+        # 8 dấu cách (sâu hơn '- name')
         mountPath: /data
         sizeGB: 1
         
+    # 'envVars' cũng phải thụt vào 4 dấu cách
     envVars:
       - key: PYTHON_VERSION
         value: 3.10
-      - key: admin
+      - key: SECRET_PATH
+        # 'fromAdmin: true' sẽ yêu cầu bạn nhập giá trị
+        # khi deploy trên trang web của Render
         fromAdmin: true
