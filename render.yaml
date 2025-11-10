@@ -6,13 +6,16 @@ services:
     plan: free
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python app.py"
-    # ...
-disks:
-  - name: data      # <--- ĐÚNG
-    mountPath: /data  # <--- ĐÚNG
-    sizeGB: 1         # <--- ĐÚNG
-envVars:
-# ...
+    
+    # --- SỬA LỖI ---
+    # 'disks' và 'envVars' phải được thụt lề vào trong,
+    # ngang hàng với 'name', 'env', 'startCommand'...
+    
+    disks:
+      - name: data
+        mountPath: /data
+        sizeGB: 1
+        
     envVars:
       - key: PYTHON_VERSION
         value: 3.10
