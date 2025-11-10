@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: saldo-bot
+    name: biendongsodu
     env: python
     plan: free # <--- THÊM DÒNG NÀY ĐỂ DÙNG GÓI MIỄN PHÍ
     
