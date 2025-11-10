@@ -2,7 +2,7 @@ import os
 import sqlite3
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -24,7 +24,7 @@ from flask import (
 APP_TITLE = "Balance Watcher Universe"
 
 # Một pass duy nhất:
-# - ADMIN_PASSWORD: dùng để login
+# - ADMIN_PASSWORD: dùng để login dashboard
 # - SECRET_KEY: nếu không set riêng thì dùng luôn ADMIN_PASSWORD
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "changeme")
 SECRET_KEY = os.getenv("SECRET_KEY", ADMIN_PASSWORD)
@@ -36,7 +36,7 @@ if not os.path.isdir(DATA_DIR):
 DB_PATH = os.path.join(DATA_DIR, "balance_watcher.db")
 
 # Mặc định nếu người dùng chưa nhập trong giao diện
-POLL_INTERVAL_DEFAULT = 30  # giây
+POLL_INTERVAL_DEFAULT = 30  # giây tối thiểu 5s
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
@@ -46,9 +46,40 @@ watcher_started = False
 watcher_running = False
 
 # =========================
-# HELPERS: format tiền & thời gian
+# Múi giờ Việt Nam
 # =========================
+try:
+    from zoneinfo import ZoneInfo
+    VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
+except Exception:
+    VN_TZ = timezone(timedelta(hours=7))
 
+def fmt_time_label_vn(dt_utc: datetime) -> str:
+    """UTC -> 'HH:MM DD/MM/YYYY (VN)'"""
+    try:
+        local = dt_utc.replace(tzinfo=timezone.utc).astimezone(VN_TZ)
+    except Exception:
+        local = dt_utc
+    return local.strftime("%H:%M %d/%m/%Y (VN)")
+
+def parse_iso_utc(s: str) -> Optional[datetime]:
+    """ISO8601 (có thể có 'Z') -> datetime UTC"""
+    if not s:
+        return None
+    try:
+        si = s.rstrip("Z")
+        dt = datetime.fromisoformat(si)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+# =========================
+# HELPERS: format tiền
+# =========================
 def fmt_amount(v: float) -> str:
     """1000000.0 -> 1,000,000đ"""
     try:
@@ -58,10 +89,6 @@ def fmt_amount(v: float) -> str:
             return f"{float(str(v).replace(',', '')):,.0f}đ"
         except Exception:
             return f"{v}đ"
-
-def fmt_time_label_utc(dt: datetime) -> str:
-    """20:40 10/11/2025 (UTC)"""
-    return dt.strftime("%H:%M %d/%m/%Y (UTC)")
 
 def to_float(s: Optional[str], default: Optional[float] = None) -> Optional[float]:
     try:
@@ -75,7 +102,6 @@ def to_float(s: Optional[str], default: Optional[float] = None) -> Optional[floa
 # =========================
 # TEMPLATE: LOGIN (UI vũ trụ)
 # =========================
-
 LOGIN_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="vi">
@@ -162,9 +188,8 @@ LOGIN_TEMPLATE = r"""
 """
 
 # =========================
-# TEMPLATE: DASHBOARD
+# TEMPLATE: DASHBOARD (giờ VN)
 # =========================
-
 DASHBOARD_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="vi">
@@ -261,7 +286,7 @@ DASHBOARD_TEMPLATE = r"""
     </div>
 
     <div class="max-w-6xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-5 items-start">
-        <!-- Cột trái: Settings + Bots + Backup -->
+        <!-- Cột trái: Settings + Bots + Backup/Restore -->
         <div class="space-y-5">
             <!-- Cài đặt chung -->
             <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
@@ -372,18 +397,46 @@ DASHBOARD_TEMPLATE = r"""
                 </div>
             </div>
 
-            <!-- Backup -->
+            <!-- Backup & Restore -->
             <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
                 <div class="flex items-center justify-between mb-3">
-                    <h2 class="text-sm font-semibold text-fuchsia-300 uppercase tracking-[0.16em]">Backup dữ liệu</h2>
+                    <h2 class="text-sm font-semibold text-fuchsia-300 uppercase tracking-[0.16em]">Backup / Restore</h2>
                 </div>
-                <p class="text-[10px] text-slate-400 mb-3">
-                    Tải xuống toàn bộ cấu hình (bots, API, trạng thái số dư cuối) để lưu trữ an toàn hoặc chuyển server.
-                </p>
-                <a href="{{ url_for('download_backup') }}"
-                   class="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-slate-800 text-slate-100 text-[11px] border border-slate-600 hover:bg-slate-700 hover:border-fuchsia-500/60 hover:text-fuchsia-200 transition-all">
-                    📦 Tải file backup (.json)
-                </a>
+
+                <p class="text-[10px] text-slate-400 mb-2">Tải xuống & phục hồi dữ liệu đều ở dạng <span class="text-sky-300 font-semibold">JSON</span>.</p>
+
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-2 mb-4">
+                    <a href="{{ url_for('download_backup') }}"
+                       class="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-slate-800 text-slate-100 text-[11px] border border-slate-600 hover:bg-slate-700 hover:border-fuchsia-500/60 hover:text-fuchsia-200 transition-all">
+                        📦 Tải toàn bộ backup (.json)
+                    </a>
+                    <a href="{{ url_for('download_settings') }}"
+                       class="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-slate-800 text-slate-100 text-[11px] border border-slate-600 hover:bg-slate-700 transition-all">
+                        ⚙️ Tải settings (.json)
+                    </a>
+                    <a href="{{ url_for('download_bots') }}"
+                       class="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-slate-800 text-slate-100 text-[11px] border border-slate-600 hover:bg-slate-700 transition-all">
+                        🤖 Tải bots (.json)
+                    </a>
+                    <a href="{{ url_for('download_apis') }}"
+                       class="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-slate-800 text-slate-100 text-[11px] border border-slate-600 hover:bg-slate-700 transition-all md:col-span-3">
+                        🌐 Tải APIs (.json)
+                    </a>
+                </div>
+
+                <form method="post" action="{{ url_for('restore_backup') }}" enctype="multipart/form-data" class="space-y-3">
+                    <label class="block text-[10px] text-slate-400 mb-1">Phục hồi từ file backup (.json)</label>
+                    <input type="file" name="backup_file" accept="application/json"
+                           class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-fuchsia-500 focus:border-fuchsia-400">
+                    <label class="inline-flex items-center gap-2 text-[10px] text-slate-400">
+                        <input type="checkbox" name="wipe" value="1" class="rounded border-slate-600 bg-slate-900">
+                        Xoá hết dữ liệu hiện tại trước khi khôi phục
+                    </label>
+                    <button type="submit"
+                            class="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-gradient-to-r from-fuchsia-500 to-purple-600 text-white text-[11px] font-medium shadow-lg hover:-translate-y-0.5 hover:shadow-xl transition-all">
+                        ♻️ Restore từ JSON
+                    </button>
+                </form>
             </div>
         </div>
 
@@ -430,7 +483,7 @@ DASHBOARD_TEMPLATE = r"""
                 <div class="flex items-center justify-between mb-3">
                     <h2 class="text-sm font-semibold text-indigo-300 uppercase tracking-[0.16em]">Danh sách API đang theo dõi</h2>
                     <span class="text-[9px] text-slate-500">
-                        Lần chạy gần nhất: <span class="text-sky-300">{{ last_run or 'chưa có' }}</span>
+                        Lần chạy gần nhất: <span class="text-sky-300">{{ last_run_vn or 'chưa có' }}</span>
                     </span>
                 </div>
                 <div class="overflow-x-auto scrollbar-thin">
@@ -465,7 +518,7 @@ DASHBOARD_TEMPLATE = r"""
                                     {% endif %}
                                 </td>
                                 <td class="px-3 py-2 text-slate-500">
-                                    {{ api.last_change or '-' }}
+                                    {{ api.last_change_vn or '-' }}
                                 </td>
                                 <td class="px-3 py-2 text-right">
                                     <form method="post" action="{{ url_for('delete_api', api_id=api.id) }}"
@@ -497,7 +550,6 @@ DASHBOARD_TEMPLATE = r"""
 # =========================
 # DB HELPER
 # =========================
-
 def init_db():
     with db_lock:
         conn = sqlite3.connect(DB_PATH)
@@ -519,11 +571,8 @@ def init_db():
         """)
 
         # Khởi tạo key mặc định nếu chưa có
-        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('default_chat_id', '')")
-        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('default_bot_id', '')")
-        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('last_run', '')")
-        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('poll_interval', '')")
-        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('global_threshold', '')")
+        for k in ["default_chat_id", "default_bot_id", "last_run", "poll_interval", "global_threshold"]:
+            c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, '')", (k,))
 
         c.execute("""
         CREATE TABLE IF NOT EXISTS apis (
@@ -596,7 +645,7 @@ def delete_bot_db(bot_id: int):
         conn.commit()
         conn.close()
 
-def add_api_db(name: str, url: str, balance_field: str):
+def add_api_db(name: str, url: str, balance_field: str) -> int:
     with db_lock:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -605,8 +654,10 @@ def add_api_db(name: str, url: str, balance_field: str):
             "VALUES (?, ?, ?, NULL, NULL)",
             (name, url, balance_field or ""),
         )
+        new_id = c.lastrowid
         conn.commit()
         conn.close()
+    return int(new_id)
 
 def delete_api_db(api_id: int):
     with db_lock:
@@ -627,10 +678,17 @@ def update_api_state(api_id: int, balance: float, changed_at: str):
         conn.commit()
         conn.close()
 
+def wipe_table(table: str):
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(f"DELETE FROM {table}")
+        conn.commit()
+        conn.close()
+
 # =========================
 # UTIL BALANCE
 # =========================
-
 def _get_by_path(data: Any, path: str) -> Any:
     if not path:
         return None
@@ -657,9 +715,7 @@ def _parse_float_like(val: Any) -> Optional[float]:
         return None
 
 def _search_balance_recursive(data: Any) -> Optional[float]:
-    """
-    Fallback: quét JSON, ưu tiên key có 'bal', 'sodu', 'money', 'credit'
-    """
+    """Fallback: quét JSON, ưu tiên key có 'bal', 'sodu', 'money', 'credit'"""
     if isinstance(data, dict):
         for k, v in data.items():
             key = k.lower()
@@ -696,7 +752,6 @@ def extract_balance_auto(data: Any, balance_field: str) -> Optional[float]:
         "money",
         "Money",
     ])
-
     seen = set()
     for path in candidates:
         p = path.strip()
@@ -707,7 +762,6 @@ def extract_balance_auto(data: Any, balance_field: str) -> Optional[float]:
         num = _parse_float_like(val)
         if num is not None:
             return num
-
     return _search_balance_recursive(data)
 
 def send_telegram(tokens: List[str], chat_id: str, text: str):
@@ -730,7 +784,6 @@ def send_telegram(tokens: List[str], chat_id: str, text: str):
 # =========================
 # WATCHER THREAD
 # =========================
-
 def watcher_loop():
     global watcher_running
     watcher_running = True
@@ -782,21 +835,18 @@ def watcher_loop():
                     resp.raise_for_status()
                     data = resp.json()
                 except Exception:
-                    # lỗi gọi API -> bỏ qua
                     continue
 
                 new_balance = extract_balance_auto(data, field)
                 if new_balance is None:
-                    # không tìm thấy trường số dư trong JSON
                     continue
 
                 now = datetime.utcnow()
-                time_label = fmt_time_label_utc(now)
+                time_label = fmt_time_label_vn(now)
 
                 # lần đầu chỉ lưu
                 if old_balance is None:
                     update_api_state(api_id, new_balance, now.isoformat() + "Z")
-                    # không bắn cảnh báo ngưỡng lần đầu để tránh spam
                     continue
 
                 old_balance = float(old_balance)
@@ -805,7 +855,6 @@ def watcher_loop():
                 # Có biến động
                 if abs(diff) >= 1e-9:
                     if diff < 0:
-                        # THANH TOÁN
                         msg = (
                             f"🔻 <b>THANH TOÁN THÀNH CÔNG</b> ({name})\n\n"
                             f"Nội dung: Thanh toán / trừ số dư\n"
@@ -814,7 +863,6 @@ def watcher_loop():
                             f"Thời gian: {time_label}"
                         )
                     else:
-                        # NẠP TIỀN
                         msg = (
                             f"💰 <b>NẠP TIỀN THÀNH CÔNG</b> ({name})\n\n"
                             f"Nội dung: Nạp tiền vào tài khoản\n"
@@ -823,15 +871,16 @@ def watcher_loop():
                             f"Thời gian: {time_label}"
                         )
 
+                    settings = get_settings()  # đọc lại chat/bot khi vừa gửi
+                    default_chat_id = (settings.get("default_chat_id") or "").strip()
                     if default_chat_id and tokens_to_use:
                         send_telegram(tokens_to_use, default_chat_id, msg)
 
                     update_api_state(api_id, new_balance, now.isoformat() + "Z")
                 else:
-                    # Không đổi -> chỉ cập nhật thời gian chạy
                     update_api_state(api_id, new_balance, api.get("last_change") or now.isoformat() + "Z")
 
-                # CẢNH BÁO NGƯỠNG CHUNG: chỉ cảnh báo khi vừa đi từ >= ngưỡng xuống < ngưỡng
+                # CẢNH BÁO NGƯỠNG CHUNG
                 if global_threshold is not None:
                     try:
                         thr = float(global_threshold)
@@ -842,16 +891,17 @@ def watcher_loop():
                                 f"Ngưỡng cảnh báo: <b>{fmt_amount(thr)}</b>\n"
                                 f"Vui lòng nạp thêm để tránh gián đoạn dịch vụ."
                             )
+                            settings = get_settings()
+                            default_chat_id = (settings.get("default_chat_id") or "").strip()
                             if default_chat_id and tokens_to_use:
                                 send_telegram(tokens_to_use, default_chat_id, alert_msg)
                     except Exception:
                         pass
 
         except Exception:
-            # tránh kill thread do lỗi bất ngờ
             pass
 
-        # ngủ theo chu kỳ hiện tại (đọc từ settings mỗi vòng)
+        # ngủ theo chu kỳ hiện tại
         try:
             settings = get_settings()
             poll_interval = to_float(settings.get("poll_interval") or "", None)
@@ -871,7 +921,6 @@ def start_watcher_once():
 # =========================
 # AUTH & ROUTES
 # =========================
-
 def is_logged_in() -> bool:
     return session.get("logged_in") is True
 
@@ -896,7 +945,7 @@ def login():
 
 @app.route("/logout")
 def logout():
-    session.clear()
+    session.clear
     flash("Đã đăng xuất.", "ok")
     return redirect(url_for("login"))
 
@@ -916,8 +965,19 @@ def dashboard():
             self.global_threshold = d.get("global_threshold", "")
 
     settings = SettingsObj(settings_raw)
-    apis = [type("ApiObj", (), a) for a in apis_raw]
-    last_run = settings_raw.get("last_run", "") or ""
+
+    # Lần chạy gần nhất (giờ VN)
+    last_run_iso = settings_raw.get("last_run", "") or ""
+    dt_last = parse_iso_utc(last_run_iso)
+    last_run_vn = fmt_time_label_vn(dt_last) if dt_last else ""
+
+    # Chuẩn bị apis + thời gian VN
+    apis = []
+    for a in apis_raw:
+        a2 = dict(a)
+        dt_chg = parse_iso_utc(a2.get("last_change") or "")
+        a2["last_change_vn"] = fmt_time_label_vn(dt_chg) if dt_chg else "-"
+        apis.append(a2)
 
     # poll interval hiệu lực hiển thị
     effective_poll_interval = to_float(settings.poll_interval or "", None)
@@ -934,7 +994,7 @@ def dashboard():
         settings=settings,
         poll_interval=POLL_INTERVAL_DEFAULT,
         watcher_running=watcher_running,
-        last_run=last_run,
+        last_run_vn=last_run_vn,
         effective_poll_interval=int(effective_poll_interval),
         global_threshold=global_threshold,
     )
@@ -946,7 +1006,6 @@ def save_settings():
     poll_interval = (request.form.get("poll_interval") or "").strip()
     global_threshold = (request.form.get("global_threshold") or "").strip()
 
-    # validate poll interval
     if poll_interval:
         try:
             pi = int(float(poll_interval))
@@ -1041,6 +1100,9 @@ def delete_api(api_id: int):
     flash(f"Đã xoá API ID {api_id}.", "ok")
     return redirect(url_for("dashboard"))
 
+# =========================
+# BACKUP & RESTORE (JSON)
+# =========================
 @app.route("/download_backup")
 def download_backup():
     import json
@@ -1049,6 +1111,7 @@ def download_backup():
         "bots": get_bots(),
         "apis": get_apis(),
         "generated_at_utc": datetime.utcnow().isoformat() + "Z",
+        "schema_version": 1,
     }
     backup_json = json.dumps(data, ensure_ascii=False, indent=2)
     return Response(
@@ -1057,6 +1120,112 @@ def download_backup():
         headers={"Content-Disposition": 'attachment; filename="balance_watcher_backup.json"'},
     )
 
+@app.route("/download_settings")
+def download_settings():
+    import json
+    backup_json = json.dumps(get_settings(), ensure_ascii=False, indent=2)
+    return Response(
+        backup_json,
+        mimetype="application/json",
+        headers={"Content-Disposition": 'attachment; filename="settings.json"'},
+    )
+
+@app.route("/download_bots")
+def download_bots():
+    import json
+    backup_json = json.dumps(get_bots(), ensure_ascii=False, indent=2)
+    return Response(
+        backup_json,
+        mimetype="application/json",
+        headers={"Content-Disposition": 'attachment; filename="bots.json"'},
+    )
+
+@app.route("/download_apis")
+def download_apis():
+    import json
+    backup_json = json.dumps(get_apis(), ensure_ascii=False, indent=2)
+    return Response(
+        backup_json,
+        mimetype="application/json",
+        headers={"Content-Disposition": 'attachment; filename="apis.json"'},
+    )
+
+@app.route("/restore_backup", methods=["POST"])
+def restore_backup():
+    """
+    Nhận file JSON, phục hồi:
+      - Nếu tick "wipe": xoá hết telegram_bots, apis
+      - Cập nhật settings theo keys (không đụng ADMIN_PASSWORD/SECRET_KEY vì là ENV)
+      - Thêm lại bots, apis; nhận last_balance/last_change nếu có
+    """
+    file = request.files.get("backup_file")
+    if not file or not file.filename.lower().endswith(".json"):
+        flash("Vui lòng chọn file .json hợp lệ.", "error")
+        return redirect(url_for("dashboard"))
+
+    import json
+    try:
+        payload = json.loads(file.read().decode("utf-8"))
+    except Exception as e:
+        flash(f"Không đọc được JSON: {e}", "error")
+        return redirect(url_for("dashboard"))
+
+    if not isinstance(payload, dict):
+        flash("Định dạng backup không hợp lệ.", "error")
+        return redirect(url_for("dashboard"))
+
+    wipe = (request.form.get("wipe") == "1")
+
+    # Khôi phục settings
+    settings = payload.get("settings", {})
+    if isinstance(settings, dict):
+        for k in ["default_chat_id", "default_bot_id", "poll_interval", "global_threshold"]:
+            if k in settings:
+                set_setting(k, str(settings.get(k) if settings.get(k) is not None else ""))
+
+    # Wipe nếu yêu cầu
+    if wipe:
+        wipe_table("telegram_bots")
+        wipe_table("apis")
+
+    # Khôi phục bots
+    bots = payload.get("bots", [])
+    if isinstance(bots, list):
+        for b in bots:
+            try:
+                name = (b.get("bot_name") or "").strip()
+                token = (b.get("bot_token") or "").strip()
+                if name and token:
+                    try:
+                        add_bot_db(name, token)
+                    except sqlite3.IntegrityError:
+                        pass
+            except Exception:
+                continue
+
+    # Khôi phục apis
+    apis = payload.get("apis", [])
+    if isinstance(apis, list):
+        for a in apis:
+            try:
+                name = (a.get("name") or "").strip()
+                url = (a.get("url") or "").strip()
+                field = (a.get("balance_field") or "").strip()
+                if name and url:
+                    new_id = add_api_db(name, url, field)
+                    try:
+                        last_bal = a.get("last_balance", None)
+                        last_chg = a.get("last_change", None)
+                        if last_bal is not None and last_chg:
+                            update_api_state(new_id, float(last_bal), str(last_chg))
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+
+    flash("Phục hồi dữ liệu từ JSON thành công.", "ok")
+    return redirect(url_for("dashboard"))
+
 @app.route("/health")
 def health():
     return {"status": "ok", "watcher_running": watcher_running}
@@ -1064,7 +1233,6 @@ def health():
 # =========================
 # KHỞI ĐỘNG
 # =========================
-
 def init_and_run():
     init_db()
     start_watcher_once()
