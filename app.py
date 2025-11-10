@@ -46,7 +46,7 @@ def login_required(f):
 
 # --- Giao diện Web (HTML) ---
 
-# Giao diện Đăng Nhập MỚI (Theo yêu cầu)
+# Giao diện Đăng Nhập (Bản hoàn thiện)
 HTML_LOGIN = """
 <!DOCTYPE html>
 <html lang="vi">
@@ -63,27 +63,31 @@ HTML_LOGIN = """
             background-image: radial-gradient(circle at 1px 1px, rgba(200, 200, 255, 0.1) 1px, transparent 0);
             background-size: 20px 20px;
         }
-        /* Thêm style cho vòng tròn tích xanh */
+        /* Style cho vòng tròn tích xanh chuyên nghiệp */
         .verified-badge {
-            display: inline-flex;
+            display: inline-flex; /* Quan trọng: Xếp hàng cùng văn bản */
             align-items: center;
             justify-content: center;
-            flex-shrink: 0; /* Ngăn co lại */
-            width: 20px;
+            flex-shrink: 0;
+            width: 20px;    /* Kích thước badge */
             height: 20px;
             border-radius: 50%;
             background-color: #3b82f6; /* Màu xanh (blue-500) */
-            color: white;
+            color: white;      /* Màu dấu tick */
             font-weight: bold;
             font-size: 12px;
-            margin-left: 8px; /* Khoảng cách với text */
+            margin-left: 6px;  /* Khoảng cách nhỏ với chữ "Linh" */
+            vertical-align: middle; /* Căn giữa theo chiều dọc với văn bản */
         }
     </style>
 </head>
 <body class="text-gray-200 min-h-screen flex items-center justify-center p-4">
     <div class="max-w-md w-full bg-gray-800/70 backdrop-blur-sm rounded-lg shadow-2xl p-8 border border-gray-700">
-        <h2 class="text-2xl font-bold text-center bg-clip-text text-transparent bg-gradient-to-r from-purple-400 to-cyan-400 mb-6 flex items-center justify-center">
-            <span>Bot được Build và phát triển bởi Admin Văn Linh</span>
+        
+        <h2 class="text-2xl font-bold text-center mb-6">
+            <span class="bg-clip-text text-transparent bg-gradient-to-r from-purple-400 to-cyan-400">
+                Bot được Build và phát triển bởi Admin Văn Linh
+            </span>
             <span class="verified-badge">✓</span>
         </h2>
         
@@ -302,7 +306,8 @@ HTML_TEMPLATE = """
                                     <th class="px-5 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Bot</th>
                                     <th class="px-5 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Chat ID</th>
                                     <th class="px-5 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Ngưỡng</th>
-                                    <th class="px-5 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Saldo Cuối</th>
+                                    
+                                    <th class="px-5 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Số Dư Cuối</th>
                                     <th class="px-5 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Trạng Thái</th>
                                     <th class="px-5 py-3 text-right text-xs font-semibold text-gray-400 uppercase tracking-wider">Xóa</th>
                                 </tr>
@@ -395,7 +400,7 @@ def init_db():
             )
         ''')
         
-        # Logic kiểm tra và nâng cấp CSDL cũ (quan trọng, không xóa)
+        # Logic kiểm tra và nâng cấp CSDL cũ
         try:
             c.execute("PRAGMA table_info(accounts)")
             cols = c.fetchall()
@@ -913,9 +918,9 @@ def import_json():
         
     return redirect(url_for('dashboard'))
 
-# --- SỬA LỖI "no such table" ---
+# --- SỬA LỖI "no such table" CỦA GUNICORN ---
 # Di chuyển 2 khối code này ra khỏi 'if __name__ == "__main__":'
-# để Gunicorn có thể chạy chúng.
+# để Gunicorn có thể chạy chúng khi khởi động.
 
 # 1. Khởi tạo CSDL ngay lập tức khi file được import
 print("Đang khởi tạo CSDL...")
