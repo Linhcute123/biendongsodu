@@ -1,4 +1,4 @@
-flask
+Flask
 requests
-apscheduler
 gunicorn
+jinja2
