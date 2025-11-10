@@ -1,4 +1,5 @@
 Flask
 requests
-gunicorn
-jinja2
+sqlite3
+typing
+tenacity
