@@ -6,13 +6,10 @@ services:
     plan: free
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python app.py"
-    # ...
-# envVars: # Dòng này có vẻ bị lặp 2 lần, tôi bỏ bớt 1 dòng
-# ...
     envVars:
       - key: PYTHON_VERSION
         value: 3.10
-      - key: admin
+      - key: SECRET_PATH
         # 'fromAdmin: true' sẽ khiến Render HỎI BẠN
         # nhập đường dẫn bí mật lúc deploy.
         fromAdmin: true
