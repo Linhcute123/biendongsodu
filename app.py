@@ -2,10 +2,8 @@ import os
 import sqlite3
 import threading
 import time
-import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, List, Optional
-import io
 
 import requests
 from flask import (
@@ -16,9 +14,8 @@ from flask import (
     url_for,
     session,
     flash,
-    send_file,
+    Response,
 )
-from functools import wraps
 
 # =========================
 # CẤU HÌNH CƠ BẢN
@@ -26,14 +23,19 @@ from functools import wraps
 
 APP_TITLE = "Balance Watcher Universe"
 
+# Một pass duy nhất:
+# - ADMIN_PASSWORD: dùng để login
+# - SECRET_KEY: nếu không set riêng thì dùng luôn ADMIN_PASSWORD
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "changeme")
 SECRET_KEY = os.getenv("SECRET_KEY", ADMIN_PASSWORD)
 
+# DB path (Render dùng /data cho persistent)
 DATA_DIR = "/data"
 if not os.path.isdir(DATA_DIR):
     DATA_DIR = "."
 DB_PATH = os.path.join(DATA_DIR, "balance_watcher.db")
 
+# Mặc định nếu người dùng chưa nhập trong giao diện
 POLL_INTERVAL_DEFAULT = 30  # giây
 
 app = Flask(__name__)
@@ -44,77 +46,34 @@ watcher_started = False
 watcher_running = False
 
 # =========================
-# HELPERS: format tiền & thời gian & trích xuất số dư
+# HELPERS: format tiền & thời gian
 # =========================
-
-VN_TIMEZONE_OFFSET = timedelta(hours=7)
-
-def get_current_vn_time() -> datetime:
-    """Lấy thời gian hiện tại theo Giờ Việt Nam (UTC+7)."""
-    return datetime.utcnow() + VN_TIMEZONE_OFFSET
-
-def fmt_time_label_vn(dt: datetime) -> str:
-    """20:40 10/11/2025 (VN)"""
-    return dt.strftime("%H:%M %d/%m/%Y (VN)")
 
 def fmt_amount(v: float) -> str:
     """1000000.0 -> 1,000,000đ"""
     try:
         return f"{float(v):,.0f}đ"
     except Exception:
-        return f"{v}đ"
+        try:
+            return f"{float(str(v).replace(',', '')):,.0f}đ"
+        except Exception:
+            return f"{v}đ"
+
+def fmt_time_label_utc(dt: datetime) -> str:
+    """20:40 10/11/2025 (UTC)"""
+    return dt.strftime("%H:%M %d/%m/%Y (UTC)")
 
 def to_float(s: Optional[str], default: Optional[float] = None) -> Optional[float]:
-    """Chuyển đổi string (có thể có dấu phẩy) sang float."""
     try:
         if s is None:
             return default
-        s = str(s).replace(",", "").strip()
+        s = s.replace(",", "").strip()
         return float(s)
     except Exception:
         return default
 
-def _get_by_path(data: Any, path: str) -> Any:
-    """Truy cập giá trị lồng nhau trong dict/list bằng path (ví dụ: 'data.balance')."""
-    if not path:
-        return None
-    cur = data
-    for part in str(path).split("."):
-        if isinstance(cur, dict):
-            cur = cur.get(part)
-        elif isinstance(cur, list) and part.isdigit():
-            try:
-                cur = cur[int(part)]
-            except IndexError:
-                return None
-        else:
-            return None
-        if cur is None:
-            return None
-    return cur
-
-def extract_balance(json_data: Dict[str, Any], balance_field: str) -> Optional[float]:
-    """Trích xuất số dư từ JSON, sử dụng balance_field hoặc tự động tìm."""
-    if balance_field:
-        value = _get_by_path(json_data, balance_field)
-        return to_float(value)
-
-    common_paths = [
-        "balance", "data.balance", "user.balance", "profile.balance", 
-        "result.balance", "wallet.balance", "amount", "data.amount", 
-        "data.money", "money",
-    ]
-    for path in common_paths:
-        value = _get_by_path(json_data, path)
-        if value is not None:
-            float_value = to_float(value)
-            if float_value is not None:
-                return float_value
-    
-    return None
-
 # =========================
-# TEMPLATES (Giữ nguyên)
+# TEMPLATE: LOGIN (UI vũ trụ)
 # =========================
 
 LOGIN_TEMPLATE = r"""
@@ -171,7 +130,7 @@ LOGIN_TEMPLATE = r"""
                     <div class="px-3 py-2 rounded-2xl text-xs
                         {% if category == 'error' %}bg-red-900/60 text-red-200 border border-red-500/40
                         {% else %}bg-emerald-900/40 text-emerald-200 border border-emerald-500/30{% endif %}">
-                      {{ message | safe }}
+                      {{ message }}
                     </div>
                   {% endfor %}
                 </div>
@@ -201,6 +160,10 @@ LOGIN_TEMPLATE = r"""
 </body>
 </html>
 """
+
+# =========================
+# TEMPLATE: DASHBOARD
+# =========================
 
 DASHBOARD_TEMPLATE = r"""
 <!DOCTYPE html>
@@ -234,7 +197,7 @@ DASHBOARD_TEMPLATE = r"""
             <div class="px-4 py-2 rounded-2xl text-xs border
                 {% if category == 'error' %}bg-red-900/60 text-red-200 border-red-500/40
                 {% else %}bg-emerald-900/40 text-emerald-200 border-emerald-500/30{% endif %}">
-              {{ message | safe }}
+              {{ message }}
             </div>
           {% endfor %}
         </div>
@@ -272,7 +235,7 @@ DASHBOARD_TEMPLATE = r"""
                 <span class="text-indigo-300 font-semibold">{{ effective_poll_interval }} giây</span>
             </div>
             <div>Ngưỡng cảnh báo chung:
-                {% if global_threshold is not none %}
+                {% if global_threshold %}
                     <span class="text-rose-300 font-semibold">{{ "{:,.0f}".format(global_threshold|float) }}đ</span>
                 {% else %}
                     <span class="text-slate-400">chưa đặt</span>
@@ -298,7 +261,9 @@ DASHBOARD_TEMPLATE = r"""
     </div>
 
     <div class="max-w-6xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-5 items-start">
+        <!-- Cột trái: Settings + Bots + Backup -->
         <div class="space-y-5">
+            <!-- Cài đặt chung -->
             <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
                 <div class="flex items-center justify-between gap-2 mb-3">
                     <h2 class="text-sm font-semibold text-indigo-300 uppercase tracking-[0.16em]">Cài đặt chung</h2>
@@ -321,7 +286,7 @@ DASHBOARD_TEMPLATE = r"""
                             class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-400">
                             <option value="">-- Gửi bằng TẤT CẢ bot --</option>
                             {% for bot in bots %}
-                                <option value="{{ bot.id }}" {% if settings.default_bot_id and settings.default_bot_id == bot.id|string %}selected{% endif %}>
+                                <option value="{{ bot.id }}" {% if settings.default_bot_id and settings.default_bot_id == bot.id %}selected{% endif %}>
                                     {{ bot.bot_name }} (..{{ bot.bot_token[-6:] }})
                                 </option>
                             {% endfor %}
@@ -330,7 +295,7 @@ DASHBOARD_TEMPLATE = r"""
 
                     <div>
                         <label class="block text-[10px] text-slate-400 mb-1">Chu kỳ quét (giây)</label>
-                        <input type="text" name="poll_interval"
+                        <input type="number" min="5" step="1" name="poll_interval"
                             value="{{ settings.poll_interval or '' }}"
                             placeholder="VD: 15, 30, 60..."
                             class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-400">
@@ -353,6 +318,7 @@ DASHBOARD_TEMPLATE = r"""
                 </form>
             </div>
 
+            <!-- Quản lý Bot -->
             <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
                 <div class="flex items-center justify-between mb-3">
                     <h2 class="text-sm font-semibold text-cyan-300 uppercase tracking-[0.16em]">Quản lý Bot Telegram</h2>
@@ -390,7 +356,7 @@ DASHBOARD_TEMPLATE = r"""
                                 </button>
                             </form>
                             <form method="post" action="{{ url_for('delete_bot') }}"
-                                    onsubmit="return confirm('Xoá bot {{ bot.bot_name }}?');">
+                                  onsubmit="return confirm('Xoá bot này?');">
                                 <input type="hidden" name="bot_id" value="{{ bot.id }}">
                                 <button class="px-2 py-1 rounded-xl bg-slate-900 text-rose-400 hover:bg-rose-600/20 hover:text-rose-300 text-[9px]">
                                     Xoá
@@ -406,34 +372,24 @@ DASHBOARD_TEMPLATE = r"""
                 </div>
             </div>
 
+            <!-- Backup -->
             <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
                 <div class="flex items-center justify-between mb-3">
-                    <h2 class="text-sm font-semibold text-fuchsia-300 uppercase tracking-[0.16em]">Backup & Restore</h2>
+                    <h2 class="text-sm font-semibold text-fuchsia-300 uppercase tracking-[0.16em]">Backup dữ liệu</h2>
                 </div>
                 <p class="text-[10px] text-slate-400 mb-3">
-                    Tải xuống toàn bộ cấu hình (bots, API, settings) để lưu trữ an toàn hoặc khôi phục lại.
+                    Tải xuống toàn bộ cấu hình (bots, API, trạng thái số dư cuối) để lưu trữ an toàn hoặc chuyển server.
                 </p>
-                <div class="space-y-3">
-                    <a href="{{ url_for('download_backup') }}"
-                       class="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-slate-800 text-slate-100 text-[11px] border border-slate-600 hover:bg-slate-700 hover:border-fuchsia-500/60 hover:text-fuchsia-200 transition-all">
-                        📦 Tải file backup (.json)
-                    </a>
-                    
-                    <form method="post" action="{{ url_for('upload_restore') }}" enctype="multipart/form-data" 
-                        onsubmit="return confirm('⚠️ CẢNH BÁO: Thao tác này sẽ XÓA TOÀN BỘ cấu hình hiện tại và khôi phục từ file. Bạn có chắc chắn?');">
-                        <label class="block text-[10px] text-slate-400 mb-1">Upload file backup (.json)</label>
-                        <input type="file" name="backup_file" required accept=".json"
-                            class="w-full text-[11px] text-slate-400 file:mr-4 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-white file:font-medium file:bg-slate-700 hover:file:bg-indigo-600 cursor-pointer">
-                        <button type="submit"
-                            class="w-full mt-3 inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-rose-700 text-white text-[11px] font-medium shadow-lg hover:bg-rose-600 transition-all">
-                            🔄 Khôi phục từ Backup
-                        </button>
-                    </form>
-                </div>
+                <a href="{{ url_for('download_backup') }}"
+                   class="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-slate-800 text-slate-100 text-[11px] border border-slate-600 hover:bg-slate-700 hover:border-fuchsia-500/60 hover:text-fuchsia-200 transition-all">
+                    📦 Tải file backup (.json)
+                </a>
             </div>
         </div>
 
+        <!-- Cột phải: Danh sách API -->
         <div class="lg:col-span-2 space-y-5">
+            <!-- Thêm API mới -->
             <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
                 <div class="flex items-center justify-between gap-2 mb-3">
                     <h2 class="text-sm font-semibold text-sky-300 uppercase tracking-[0.16em]">Thêm API số dư</h2>
@@ -469,6 +425,7 @@ DASHBOARD_TEMPLATE = r"""
                 </form>
             </div>
 
+            <!-- Danh sách API -->
             <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
                 <div class="flex items-center justify-between mb-3">
                     <h2 class="text-sm font-semibold text-indigo-300 uppercase tracking-[0.16em]">Danh sách API đang theo dõi</h2>
@@ -512,7 +469,7 @@ DASHBOARD_TEMPLATE = r"""
                                 </td>
                                 <td class="px-3 py-2 text-right">
                                     <form method="post" action="{{ url_for('delete_api', api_id=api.id) }}"
-                                            onsubmit="return confirm('Xoá API {{ api.name }} khỏi danh sách theo dõi?');">
+                                          onsubmit="return confirm('Xoá API này khỏi danh sách theo dõi?');">
                                         <button class="px-2 py-1 rounded-xl bg-slate-950 text-rose-400 hover:bg-rose-600/20 hover:text-rose-300">
                                             ✖
                                         </button>
@@ -561,6 +518,7 @@ def init_db():
         )
         """)
 
+        # Khởi tạo key mặc định nếu chưa có
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('default_chat_id', '')")
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('default_bot_id', '')")
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('last_run', '')")
@@ -571,9 +529,9 @@ def init_db():
         CREATE TABLE IF NOT EXISTS apis (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
-            url TEXT NOT NULL UNIQUE,
+            url TEXT NOT NULL,
             balance_field TEXT NOT NULL,
-            last_balance INTEGER,  
+            last_balance REAL,
             last_change TEXT
         )
         """)
@@ -582,11 +540,12 @@ def init_db():
         conn.close()
 
 def get_settings() -> Dict[str, Optional[str]]:
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT key, value FROM settings")
-    rows = c.fetchall()
-    conn.close()
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT key, value FROM settings")
+        rows = c.fetchall()
+        conn.close()
     return {k: (v if v is not None else "") for k, v in rows}
 
 def set_setting(key: str, value: str):
@@ -657,520 +616,461 @@ def delete_api_db(api_id: int):
         conn.commit()
         conn.close()
 
-def update_api_state(api_id: int, balance: float):
-    """Lưu số dư dưới dạng INTEGER và thời gian theo giờ VN."""
+def update_api_state(api_id: int, balance: float, changed_at: str):
     with db_lock:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        
-        int_balance = int(balance) 
-        vn_time_str = fmt_time_label_vn(get_current_vn_time())
-        
         c.execute(
             "UPDATE apis SET last_balance=?, last_change=? WHERE id=?",
-            (int_balance, vn_time_str, api_id),
+            (balance, changed_at, api_id),
         )
         conn.commit()
         conn.close()
 
-def clear_all_data():
-    """Xóa tất cả dữ liệu trong bảng apis và telegram_bots, và reset settings."""
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        
-        c.execute("DELETE FROM apis")
-        c.execute("DELETE FROM telegram_bots")
-        c.execute("DELETE FROM settings WHERE key NOT IN ('admin_password_hash', 'secret_key')") 
-        
-        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('default_chat_id', '')")
-        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('default_bot_id', '')")
-        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('last_run', '')")
-        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('poll_interval', '')")
-        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('global_threshold', '')")
-        
-        conn.commit()
-        conn.close()
-
 # =========================
-# TELEGRAM NOTIFIER
+# UTIL BALANCE
 # =========================
 
-def send_telegram_message(token: str, chat_id: str, message: str) -> bool:
-    """Gửi tin nhắn Telegram và trả về True nếu thành công."""
-    if not token or not chat_id or not message:
-        return False
-
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": "True",
-    }
-    
-    try:
-        response = requests.post(url, data=payload, timeout=10)
-        response.raise_for_status()
-        return response.json().get('ok', False)
-    except requests.exceptions.RequestException as e:
-        print(f"Lỗi gửi Telegram (Bot ...{token[-6:]}): {e}")
-        return False
-
-def notify_change(api: Dict[str, Any], change: int, new_balance: float, settings: Dict[str, Optional[str]], bots: List[Dict[str, Any]]):
-    """Gửi thông báo khi số dư thay đổi đáng kể."""
-    
-    global_threshold_float = to_float(settings.get('global_threshold')) or 0.0
-    
-    # 💡 SỬA LỖI NGƯỠNG: Ép ngưỡng về INT để so sánh nhất quán với 'change'
-    global_threshold_int = int(global_threshold_float)
-    
-    if abs(change) < global_threshold_int:
-        return
-
-    if not settings.get('default_chat_id') or not bots:
-        print("Bỏ qua cảnh báo: Thiếu Chat ID hoặc Bot Token.")
-        return
-
-    chat_id = settings['default_chat_id']
-    
-    if change > 0:
-        change_type = "💰 CỘNG TIỀN (Deposit)"
-        change_color = "🟢"
-        emoji = "✨"
-    else:
-        change_type = "💸 THANH TOÁN (Payment/Withdraw)"
-        change_color = "🔴"
-        emoji = "⚠️"
-
-    old_balance_float = new_balance - change
-    vn_time_str = fmt_time_label_vn(get_current_vn_time())
-
-    message = f"""{emoji} <b>BALANCE WATCHER ALERT</b> {emoji}
----
-<b>Trang web:</b> <code>{api['name']}</code>
-<b>Phân loại:</b> {change_type}
-
-<b>Biến động:</b> {change_color} <b>{fmt_amount(float(change))}</b>
-<b>Số dư cũ:</b> {fmt_amount(old_balance_float)}
-<b>Số dư mới:</b> {fmt_amount(new_balance)}
-
-<b>Thời gian (VN):</b> {vn_time_str}
-"""
-    
-    bots_to_send = []
-    if settings.get('default_bot_id'):
-        default_bot = next((b for b in bots if b['id'] == int(settings['default_bot_id'])), None)
-        if default_bot:
-            bots_to_send.append(default_bot)
+def _get_by_path(data: Any, path: str) -> Any:
+    if not path:
+        return None
+    cur = data
+    for part in str(path).split("."):
+        if isinstance(cur, dict):
+            cur = cur.get(part)
         else:
-            bots_to_send = bots
-    else:
-        bots_to_send = bots
-        
-    for bot in bots_to_send:
-        success = send_telegram_message(bot['bot_token'], chat_id, message)
-        if not success:
-            print(f"Lỗi gửi cảnh báo bằng bot: {bot['bot_name']}")
+            return None
+    return cur
 
-# =========================
-# WATCHER CORE LOGIC
-# =========================
+def _parse_float_like(val: Any) -> Optional[float]:
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val)
+    cleaned = "".join(ch for ch in s if (ch.isdigit() or ch in ",.-"))
+    if not cleaned:
+        return None
+    try:
+        return float(cleaned.replace(",", ""))
+    except Exception:
+        return None
 
-def check_balances():
-    """Kiểm tra số dư tất cả API và cập nhật/cảnh báo."""
-    settings = get_settings()
-    apis = get_apis()
-    bots = get_bots()
-    
-    vn_time = get_current_vn_time()
-    run_time = vn_time.strftime("%H:%M:%S %d/%m")
-    set_setting('last_run', run_time)
-    
-    global_threshold_val = settings.get('global_threshold') or '0'
-    print(f"[{run_time}] Bắt đầu chu kỳ quét ({len(apis)} API) - Threshold: {global_threshold_val}đ")
+def _search_balance_recursive(data: Any) -> Optional[float]:
+    """
+    Fallback: quét JSON, ưu tiên key có 'bal', 'sodu', 'money', 'credit'
+    """
+    if isinstance(data, dict):
+        for k, v in data.items():
+            key = k.lower()
+            if any(x in key for x in ["bal", "sodu", "so_du", "money", "credit"]):
+                num = _parse_float_like(v)
+                if num is not None:
+                    return num
+        for v in data.values():
+            found = _search_balance_recursive(v)
+            if found is not None:
+                return found
+    elif isinstance(data, list):
+        for item in data:
+            found = _search_balance_recursive(item)
+            if found is not None:
+                return found
+    return None
 
-    for api in apis:
+def extract_balance_auto(data: Any, balance_field: str) -> Optional[float]:
+    candidates: List[str] = []
+    if balance_field:
+        candidates.append(balance_field.strip())
+    candidates.extend([
+        "balance",
+        "data.balance",
+        "user.balance",
+        "Data.balance",
+        "result.balance",
+        "info.balance",
+        "sodu",
+        "so_du",
+        "data.sodu",
+        "data.so_du",
+        "money",
+        "Money",
+    ])
+
+    seen = set()
+    for path in candidates:
+        p = path.strip()
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        val = _get_by_path(data, p)
+        num = _parse_float_like(val)
+        if num is not None:
+            return num
+
+    return _search_balance_recursive(data)
+
+def send_telegram(tokens: List[str], chat_id: str, text: str):
+    if not chat_id or not tokens:
+        return
+    for token in tokens:
+        token = (token or "").strip()
+        if not token:
+            continue
         try:
-            # 1. Gọi API
-            response = requests.get(api['url'], timeout=15)
-            response.raise_for_status()
-            json_data = response.json()
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            requests.post(
+                url,
+                data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+                timeout=10,
+            )
+        except Exception:
+            continue
 
-            # 2. Trích xuất số dư (vẫn là float để giữ độ chính xác tối đa)
-            new_balance = extract_balance(json_data, api['balance_field'])
+# =========================
+# WATCHER THREAD
+# =========================
 
-            if new_balance is None:
-                continue
-            
-            new_balance = float(new_balance)
-            
-            # 3. So sánh và Cảnh báo
-            old_balance_int = api.get('last_balance')
-            
-            if old_balance_int is not None:
-                new_balance_int = int(new_balance) 
-                
-                change = new_balance_int - old_balance_int
-                
-                if abs(change) > 0:
-                    print(f"💰 Phát hiện thay đổi trên {api['name']} ({api['last_balance']} -> {new_balance_int})")
-                    notify_change(api, change, new_balance, settings, bots)
-            
-            # 4. Cập nhật DB
-            update_api_state(api['id'], new_balance) 
-
-        except requests.exceptions.RequestException as e:
-            print(f"❌ Lỗi HTTP/Network khi quét {api['name']}: {e}")
-        except json.JSONDecodeError:
-            print(f"❌ Lỗi JSON response từ {api['name']}")
-        except Exception as e:
-            print(f"❌ Lỗi không xác định khi xử lý {api['name']}: {e}")
-
-    print(f"[{run_time}] Hoàn thành chu kỳ quét.")
-
-
-def watcher_thread():
-    """Luồng chạy nền của watcher."""
+def watcher_loop():
     global watcher_running
-    print("Watcher thread started.")
     watcher_running = True
-    
-    while watcher_running:
-        settings = get_settings()
-        poll_interval = to_float(settings.get('poll_interval'))
-        if not poll_interval or poll_interval < 5:
+    while True:
+        try:
+            settings = get_settings()
+            apis = get_apis()
+            bots = get_bots()
+
+            # Poll interval do user đặt (fallback mặc định)
+            poll_interval = to_float(settings.get("poll_interval") or "", None)
+            if poll_interval is None or poll_interval < 5:
+                poll_interval = POLL_INTERVAL_DEFAULT
+
+            default_chat_id = (settings.get("default_chat_id") or "").strip()
+            default_bot_id = settings.get("default_bot_id") or ""
+            global_threshold = to_float(settings.get("global_threshold") or "", None)
+
+            last_run_str = datetime.utcnow().isoformat() + "Z"
+            set_setting("last_run", last_run_str)
+
+            # chọn token
+            tokens_to_use: List[str] = []
+            if default_bot_id:
+                try:
+                    bid = int(default_bot_id)
+                    for b in bots:
+                        if b["id"] == bid:
+                            tokens_to_use = [b["bot_token"]]
+                            break
+                except ValueError:
+                    pass
+            if not tokens_to_use:
+                tokens_to_use = [b["bot_token"] for b in bots]
+
+            for api in apis:
+                api_id = api["id"]
+                name = api["name"]
+                url = api["url"]
+                field = api["balance_field"] or ""
+                old_balance = api["last_balance"]
+
+                if not url:
+                    continue
+
+                # gọi API
+                try:
+                    resp = requests.get(url, timeout=15)
+                    resp.raise_for_status()
+                    data = resp.json()
+                except Exception:
+                    # lỗi gọi API -> bỏ qua
+                    continue
+
+                new_balance = extract_balance_auto(data, field)
+                if new_balance is None:
+                    # không tìm thấy trường số dư trong JSON
+                    continue
+
+                now = datetime.utcnow()
+                time_label = fmt_time_label_utc(now)
+
+                # lần đầu chỉ lưu
+                if old_balance is None:
+                    update_api_state(api_id, new_balance, now.isoformat() + "Z")
+                    # không bắn cảnh báo ngưỡng lần đầu để tránh spam
+                    continue
+
+                old_balance = float(old_balance)
+                diff = new_balance - old_balance
+
+                # Có biến động
+                if abs(diff) >= 1e-9:
+                    if diff < 0:
+                        # THANH TOÁN
+                        msg = (
+                            f"🔻 <b>THANH TOÁN THÀNH CÔNG</b> ({name})\n\n"
+                            f"Nội dung: Thanh toán / trừ số dư\n"
+                            f"Tổng trừ: <b>-{fmt_amount(abs(diff))}</b>\n"
+                            f"Số dư cuối: <b>{fmt_amount(new_balance)}</b>\n"
+                            f"Thời gian: {time_label}"
+                        )
+                    else:
+                        # NẠP TIỀN
+                        msg = (
+                            f"💰 <b>NẠP TIỀN THÀNH CÔNG</b> ({name})\n\n"
+                            f"Nội dung: Nạp tiền vào tài khoản\n"
+                            f"Biến động: <b>+{fmt_amount(diff)}</b>\n"
+                            f"Số dư cuối: <b>{fmt_amount(new_balance)}</b>\n"
+                            f"Thời gian: {time_label}"
+                        )
+
+                    if default_chat_id and tokens_to_use:
+                        send_telegram(tokens_to_use, default_chat_id, msg)
+
+                    update_api_state(api_id, new_balance, now.isoformat() + "Z")
+                else:
+                    # Không đổi -> chỉ cập nhật thời gian chạy
+                    update_api_state(api_id, new_balance, api.get("last_change") or now.isoformat() + "Z")
+
+                # CẢNH BÁO NGƯỠNG CHUNG: chỉ cảnh báo khi vừa đi từ >= ngưỡng xuống < ngưỡng
+                if global_threshold is not None:
+                    try:
+                        thr = float(global_threshold)
+                        if old_balance >= thr and new_balance < thr:
+                            alert_msg = (
+                                f"🚨 <b>CẢNH BÁO SỐ DƯ THẤP</b> ({name})\n\n"
+                                f"Tài khoản chỉ còn: <b>{fmt_amount(new_balance)}</b>\n"
+                                f"Ngưỡng cảnh báo: <b>{fmt_amount(thr)}</b>\n"
+                                f"Vui lòng nạp thêm để tránh gián đoạn dịch vụ."
+                            )
+                            if default_chat_id and tokens_to_use:
+                                send_telegram(tokens_to_use, default_chat_id, alert_msg)
+                    except Exception:
+                        pass
+
+        except Exception:
+            # tránh kill thread do lỗi bất ngờ
+            pass
+
+        # ngủ theo chu kỳ hiện tại (đọc từ settings mỗi vòng)
+        try:
+            settings = get_settings()
+            poll_interval = to_float(settings.get("poll_interval") or "", None)
+            if poll_interval is None or poll_interval < 5:
+                poll_interval = POLL_INTERVAL_DEFAULT
+        except Exception:
             poll_interval = POLL_INTERVAL_DEFAULT
-            
-        check_balances()
-        
-        print(f"Tạm dừng {int(poll_interval)} giây...")
         time.sleep(poll_interval)
-    
-    print("Watcher thread stopped.")
 
-
-def start_watcher():
-    """Bắt đầu luồng watcher nếu chưa chạy."""
+def start_watcher_once():
     global watcher_started
     if not watcher_started:
-        thread = threading.Thread(target=watcher_thread)
-        thread.daemon = True
-        thread.start()
         watcher_started = True
+        t = threading.Thread(target=watcher_loop, daemon=True)
+        t.start()
 
 # =========================
-# FLASK ROUTES
+# AUTH & ROUTES
 # =========================
 
-def login_required(f):
-    """Decorator kiểm tra đăng nhập."""
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if session.get("logged_in") != True:
-            flash("Vui lòng đăng nhập để truy cập Dashboard.", "error")
-            return redirect(url_for("login"))
-        return f(*args, **kwargs)
-    return decorated_function
+def is_logged_in() -> bool:
+    return session.get("logged_in") is True
 
-@app.route("/", methods=["GET", "POST"])
+@app.before_request
+def require_login():
+    if request.endpoint in ("login", "health", "static"):
+        return
+    if not is_logged_in():
+        return redirect(url_for("login"))
+
+@app.route("/login", methods=["GET", "POST"])
 def login():
-    """Route Đăng nhập."""
-    if session.get("logged_in"):
-        return redirect(url_for("dashboard"))
-
     if request.method == "POST":
-        password = request.form.get("password")
-        if password == ADMIN_PASSWORD:
+        pwd = request.form.get("password", "")
+        if pwd == ADMIN_PASSWORD:
             session["logged_in"] = True
-            flash("Đăng nhập thành công! Chào mừng trở lại vũ trụ.", "success")
-            if os.environ.get("FLASK_ENV") == "development":
-                start_watcher()
+            flash("Đăng nhập thành công. Chào mừng Admin Văn Linh đến vũ trụ giám sát số dư.", "ok")
             return redirect(url_for("dashboard"))
         else:
-            flash("Mật khẩu quản trị không chính xác.", "error")
-
+            flash("Sai mật khẩu.", "error")
     return render_template_string(LOGIN_TEMPLATE, title=APP_TITLE)
 
 @app.route("/logout")
 def logout():
-    """Route Đăng xuất."""
-    session.pop("logged_in", None)
-    flash("Bạn đã đăng xuất.", "success")
+    session.clear()
+    flash("Đã đăng xuất.", "ok")
     return redirect(url_for("login"))
 
-
-@app.route("/dashboard")
-@login_required
+@app.route("/")
 def dashboard():
-    """Route Dashboard chính."""
-    settings = get_settings()
+    start_watcher_once()
+    settings_raw = get_settings()
     bots = get_bots()
-    apis = get_apis()
+    apis_raw = get_apis()
 
-    poll_interval_db = to_float(settings.get('poll_interval'))
-    effective_poll_interval = int(poll_interval_db) if poll_interval_db and poll_interval_db >= 5 else POLL_INTERVAL_DEFAULT
-    
-    global_threshold_val = to_float(settings.get('global_threshold'))
+    class SettingsObj:
+        def __init__(self, d):
+            self.default_chat_id = d.get("default_chat_id", "")
+            self.default_bot_id = int(d["default_bot_id"]) if d.get("default_bot_id", "").isdigit() else None
+            self.last_run = d.get("last_run", "") or ""
+            self.poll_interval = d.get("poll_interval", "")
+            self.global_threshold = d.get("global_threshold", "")
+
+    settings = SettingsObj(settings_raw)
+    apis = [type("ApiObj", (), a) for a in apis_raw]
+    last_run = settings_raw.get("last_run", "") or ""
+
+    # poll interval hiệu lực hiển thị
+    effective_poll_interval = to_float(settings.poll_interval or "", None)
+    if effective_poll_interval is None or effective_poll_interval < 5:
+        effective_poll_interval = POLL_INTERVAL_DEFAULT
+
+    global_threshold = to_float(settings.global_threshold or "", None)
 
     return render_template_string(
         DASHBOARD_TEMPLATE,
         title=APP_TITLE,
-        settings=settings,
         bots=bots,
         apis=apis,
+        settings=settings,
+        poll_interval=POLL_INTERVAL_DEFAULT,
         watcher_running=watcher_running,
-        effective_poll_interval=effective_poll_interval,
-        last_run=settings.get('last_run', 'chưa có'),
-        global_threshold=global_threshold_val,
+        last_run=last_run,
+        effective_poll_interval=int(effective_poll_interval),
+        global_threshold=global_threshold,
     )
 
 @app.route("/save_settings", methods=["POST"])
-@login_required
 def save_settings():
-    """Lưu cấu hình chung."""
-    default_chat_id = request.form.get("default_chat_id", "").strip()
-    default_bot_id = request.form.get("default_bot_id", "").strip()
-    poll_interval = request.form.get("poll_interval", "").strip()
-    global_threshold = request.form.get("global_threshold", "").strip()
+    default_chat_id = (request.form.get("default_chat_id") or "").strip()
+    default_bot_id = (request.form.get("default_bot_id") or "").strip()
+    poll_interval = (request.form.get("poll_interval") or "").strip()
+    global_threshold = (request.form.get("global_threshold") or "").strip()
 
-    try:
-        if poll_interval:
-            interval_sec = to_float(poll_interval)
-            if interval_sec is None or interval_sec < 5:
-                 flash("Chu kỳ quét tối thiểu là **5 giây** và phải là số hợp lệ.", "error")
-                 return redirect(url_for("dashboard"))
-            poll_interval = str(int(interval_sec))
-        
-        if global_threshold:
-            global_threshold = global_threshold.replace(",", "")
-            if to_float(global_threshold) is None:
-                flash("Ngưỡng cảnh báo không hợp lệ. Vui lòng nhập số (ví dụ: 1000000).", "error")
+    # validate poll interval
+    if poll_interval:
+        try:
+            pi = int(float(poll_interval))
+            if pi < 5:
+                flash("Chu kỳ quét tối thiểu là 5 giây.", "error")
                 return redirect(url_for("dashboard"))
+        except Exception:
+            flash("Chu kỳ quét không hợp lệ.", "error")
+            return redirect(url_for("dashboard"))
 
-        set_setting('default_chat_id', default_chat_id)
-        set_setting('default_bot_id', default_bot_id)
-        set_setting('poll_interval', poll_interval)
-        set_setting('global_threshold', global_threshold)
-        
-        flash("💾 Cấu hình chung đã được lưu thành công! **Watcher sẽ áp dụng chu kỳ quét mới sau lần chạy hiện tại.**", "success")
-        
-    except Exception as e:
-        flash(f"Lỗi khi lưu cấu hình: {e}", "error")
+    set_setting("default_chat_id", default_chat_id)
+    set_setting("default_bot_id", default_bot_id)
+    set_setting("poll_interval", poll_interval)
+    set_setting("global_threshold", global_threshold)
 
+    flash("Đã lưu cấu hình hệ thống.", "ok")
     return redirect(url_for("dashboard"))
-
 
 @app.route("/add_bot", methods=["POST"])
-@login_required
 def add_bot():
-    """Thêm bot Telegram mới."""
-    bot_name = request.form.get("bot_name", "").strip()
-    bot_token = request.form.get("bot_token", "").strip()
-
-    if not bot_name or not bot_token:
-        flash("Tên bot và Token bot không được để trống.", "error")
+    name = (request.form.get("bot_name") or "").strip()
+    token = (request.form.get("bot_token") or "").strip()
+    if not name or not token:
+        flash("Thiếu tên hoặc token bot.", "error")
         return redirect(url_for("dashboard"))
-        
     try:
-        add_bot_db(bot_name, bot_token)
-        flash(f"➕ Bot '<b>{bot_name}</b>' đã được thêm thành công!", "success")
+        add_bot_db(name, token)
+        flash("Đã thêm bot mới.", "ok")
     except sqlite3.IntegrityError:
-        flash("Bot Token này đã tồn tại trong hệ thống.", "error")
+        flash("Token bot này đã tồn tại.", "error")
     except Exception as e:
         flash(f"Lỗi khi thêm bot: {e}", "error")
-
     return redirect(url_for("dashboard"))
 
-
 @app.route("/delete_bot", methods=["POST"])
-@login_required
 def delete_bot():
-    """Xóa bot Telegram."""
-    bot_id = request.form.get("bot_id", type=int)
-    
-    if bot_id:
-        delete_bot_db(bot_id)
-        
-        settings = get_settings()
-        if settings.get('default_bot_id') == str(bot_id):
-            set_setting('default_bot_id', '')
-            
-        flash("✖ Bot đã được xoá thành công.", "success")
-    else:
+    try:
+        bot_id = int(request.form.get("bot_id") or "0")
+    except ValueError:
         flash("ID bot không hợp lệ.", "error")
-        
+        return redirect(url_for("dashboard"))
+
+    delete_bot_db(bot_id)
+
+    settings = get_settings()
+    if settings.get("default_bot_id") == str(bot_id):
+        set_setting("default_bot_id", "")
+
+    flash("Đã xoá bot.", "ok")
     return redirect(url_for("dashboard"))
 
 @app.route("/test_bot", methods=["POST"])
-@login_required
 def test_bot():
-    """Thử nghiệm gửi tin nhắn bằng bot cụ thể."""
-    bot_id = request.form.get("bot_id", type=int)
-    settings = get_settings()
-    
-    if not settings.get('default_chat_id'):
-        flash("🚨 Thiếu **Chat ID mặc định**. Vui lòng thiết lập Chat ID trước khi Test.", "error")
+    try:
+        bot_id = int(request.form.get("bot_id") or "0")
+    except ValueError:
+        flash("ID bot không hợp lệ.", "error")
         return redirect(url_for("dashboard"))
 
     bots = get_bots()
-    test_bot = next((b for b in bots if b['id'] == bot_id), None)
-
-    if not test_bot:
-        flash("Bot không tồn tại.", "error")
+    bot = next((b for b in bots if b["id"] == bot_id), None)
+    if not bot:
+        flash("Không tìm thấy bot.", "error")
         return redirect(url_for("dashboard"))
 
-    message = f"✅ <b>[TEST]</b> Bot <code>{test_bot['bot_name']}</code> đang hoạt động! Tin nhắn gửi từ Balance Watcher Universe."
-    success = send_telegram_message(test_bot['bot_token'], settings['default_chat_id'], message)
-    
-    if success:
-        flash(f"🎉 Gửi tin nhắn TEST thành công bằng bot: <b>{test_bot['bot_name']}</b>", "success")
-    else:
-        flash(f"❌ Lỗi gửi tin nhắn TEST bằng bot: <b>{test_bot['bot_name']}</b>. Kiểm tra lại **Token và Chat ID**.", "error")
-        
-    return redirect(url_for("dashboard"))
+    settings = get_settings()
+    chat_id = (settings.get("default_chat_id") or "").strip()
+    if not chat_id:
+        flash("Chưa cấu hình TELEGRAM_CHAT_ID.", "error")
+        return redirect(url_for("dashboard"))
 
+    send_telegram([bot["bot_token"]], chat_id,
+                  "✅ <b>Test thành công</b>\nBot đã kết nối và sẵn sàng gửi cảnh báo biến động số dư.")
+    flash("Đã gửi test message đến Telegram.", "ok")
+    return redirect(url_for("dashboard"))
 
 @app.route("/add_api", methods=["POST"])
-@login_required
 def add_api():
-    """Thêm API số dư mới."""
-    name = request.form.get("name", "").strip()
-    url = request.form.get("url", "").strip()
-    balance_field = request.form.get("balance_field", "").strip()
-
+    name = (request.form.get("name") or "").strip()
+    url = (request.form.get("url") or "").strip()
+    balance_field = (request.form.get("balance_field") or "").strip()
     if not name or not url:
-        flash("Tên hiển thị và URL API không được để trống.", "error")
+        flash("Thiếu tên hoặc URL API.", "error")
         return redirect(url_for("dashboard"))
-
-    try:
-        if not url.startswith(("http://", "https://")):
-            flash("URL API không hợp lệ (phải bắt đầu bằng **http://** hoặc **https://**).", "error")
-            return redirect(url_for("dashboard"))
-
-        add_api_db(name, url, balance_field)
-        flash(f"➕ API '<b>{name}</b>' đã được thêm vào danh sách theo dõi!", "success")
-    except sqlite3.IntegrityError:
-        flash("URL API này đã tồn tại trong hệ thống.", "error")
-    except Exception as e:
-        flash(f"Lỗi khi thêm API: {e}", "error")
-
+    add_api_db(name, url, balance_field)
+    flash(f"Đã thêm API [{name}].", "ok")
     return redirect(url_for("dashboard"))
-
 
 @app.route("/delete_api/<int:api_id>", methods=["POST"])
-@login_required
 def delete_api(api_id: int):
-    """Xóa API số dư."""
-    try:
-        delete_api_db(api_id)
-        flash("✖ API đã được xoá khỏi danh sách theo dõi.", "success")
-    except Exception as e:
-        flash(f"Lỗi khi xoá API: {e}", "error")
-        
+    delete_api_db(api_id)
+    flash(f"Đã xoá API ID {api_id}.", "ok")
     return redirect(url_for("dashboard"))
-
 
 @app.route("/download_backup")
-@login_required
 def download_backup():
-    """Tải xuống file backup ở dạng JSON."""
-    
-    backup_data = {
-        "timestamp": get_current_vn_time().isoformat(),
+    import json
+    data = {
         "settings": get_settings(),
-        "telegram_bots": get_bots(),
+        "bots": get_bots(),
         "apis": get_apis(),
+        "generated_at_utc": datetime.utcnow().isoformat() + "Z",
     }
-    
-    response = app.response_class(
-        response=json.dumps(backup_data, indent=4),
-        status=200,
-        mimetype='application/json'
+    backup_json = json.dumps(data, ensure_ascii=False, indent=2)
+    return Response(
+        backup_json,
+        mimetype="application/json",
+        headers={"Content-Disposition": 'attachment; filename="balance_watcher_backup.json"'},
     )
-    response.headers.set("Content-Disposition", "attachment", filename="balance_watcher_backup.json")
-    return response
 
-@app.route("/upload_restore", methods=["POST"])
-@login_required
-def upload_restore():
-    """Khôi phục dữ liệu từ file JSON."""
-    
-    if 'backup_file' not in request.files:
-        flash("Không tìm thấy file backup.", "error")
-        return redirect(url_for("dashboard"))
-    
-    file = request.files['backup_file']
-    if file.filename == '':
-        flash("Vui lòng chọn file JSON để khôi phục.", "error")
-        return redirect(url_for("dashboard"))
-        
-    if not file.filename.lower().endswith('.json'):
-        flash("File không đúng định dạng. Vui lòng chọn file .json.", "error")
-        return redirect(url_for("dashboard"))
-
-    try:
-        data = json.load(io.TextIOWrapper(file.stream, encoding='utf-8'))
-        
-        if not all(k in data for k in ["settings", "telegram_bots", "apis"]):
-            flash("Cấu trúc file JSON không hợp lệ. Thiếu trường 'settings', 'telegram_bots' hoặc 'apis'.", "error")
-            return redirect(url_for("dashboard"))
-            
-        clear_all_data()
-        
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        
-        for key, value in data["settings"].items():
-            if key not in ['admin_password_hash', 'secret_key']:
-                set_setting(key, value)
-                
-        for bot in data["telegram_bots"]:
-            try:
-                c.execute(
-                    "INSERT INTO telegram_bots (bot_name, bot_token) VALUES (?, ?)",
-                    (bot['bot_name'], bot['bot_token']),
-                )
-            except sqlite3.IntegrityError:
-                 flash(f"⚠️ Cảnh báo: Bot '{bot['bot_name']}' bị trùng Token và đã bị bỏ qua.", "error")
-        
-        for api in data["apis"]:
-            try:
-                last_balance_int = int(float(api.get('last_balance'))) if api.get('last_balance') is not None else None
-
-                c.execute(
-                    "INSERT INTO apis (name, url, balance_field, last_balance, last_change) VALUES (?, ?, ?, ?, ?)",
-                    (api['name'], api['url'], api['balance_field'], last_balance_int, api.get('last_change')),
-                )
-            except sqlite3.IntegrityError:
-                 flash(f"⚠️ Cảnh báo: API '{api['name']}' bị trùng URL và đã bị bỏ qua.", "error")
-            
-        conn.commit()
-        conn.close()
-        
-        flash("✅ Khôi phục dữ liệu thành công! Vui lòng kiểm tra lại cấu hình và trạng thái Watcher.", "success")
-        
-    except json.JSONDecodeError:
-        flash("Lỗi: File JSON không hợp lệ.", "error")
-    except Exception as e:
-        flash(f"Lỗi khôi phục không xác định: {e}", "error")
-        
-    return redirect(url_for("dashboard"))
-
+@app.route("/health")
+def health():
+    return {"status": "ok", "watcher_running": watcher_running}
 
 # =========================
-# KHỞI TẠO VÀ CHẠY
+# KHỞI ĐỘNG
 # =========================
 
-init_db() 
+def init_and_run():
+    init_db()
+    start_watcher_once()
 
-if os.environ.get("FLASK_ENV") != "development":
-    start_watcher()
-    print("Watcher Thread được tự động khởi động (Production mode).")
-else:
-    print("Watcher Thread sẽ được khởi động khi Admin đăng nhập lần đầu (Development mode).")
-
+init_and_run()
 
 if __name__ == "__main__":
-    print("Khởi động ứng dụng Flask (Dev Server)...")
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)), debug=os.environ.get("FLASK_ENV") == "development")
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
