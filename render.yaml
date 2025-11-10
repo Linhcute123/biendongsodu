@@ -2,6 +2,19 @@ services:
   - type: web
     name: biendongsodu
     env: python
+    region: singapore
     plan: free
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "gunicorn app:app"
+    startCommand: "python app.py"
+    disks:
+      - name: data
+        mountPath: /data
+        sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10
+      - key: ADMIN_PASSWORD
+        # Render sẽ hỏi mật khẩu này lúc deploy
+        fromAdmin: true
+      - key: POLL_INTERVAL
+        value: 120 # Quét mỗi 120 giây (2 phút)
