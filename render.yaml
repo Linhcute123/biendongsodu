@@ -1,17 +1,31 @@
 services:
+  # 1. Dịch vụ Web cho ứng dụng Flask
   - type: web
-    name: saldo-bot
+    name: biendongsodu
     env: python
-    plan: free 
+    plan: free # Dùng gói Free (Cảnh báo: Sẽ tự động ngủ)
 
     # Lệnh cài đặt thư viện
     buildCommand: "pip install -r requirements.txt"
     
-    # Lệnh chạy ứng dụng (SỬA DÒNG NÀY)
-    startCommand: "gunicorn app:app --bind 0.0.0.0:$PORT --workers 1"
+    # Lệnh chạy ứng dụng
+    startCommand: "gunicorn app:app -b 0.0.0.0:$PORT --workers 1"
     
     # Biến môi trường
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.9"
       - key: ADMIN_PASSWORD
+        # Đây là mật khẩu dùng để đăng nhập, ví dụ: 'your_super_safe_pass'
+        # RENDER sẽ nhắc bạn đặt giá trị này khi tạo Blueprint.
+      - key: FLASK_SECRET_KEY
+        # KEY BÍ MẬT KHÁC cho Flask session (Bảo mật hơn ADMIN_PASSWORD)
+        generateValue: true 
+
+    # 2. Cấu hình Persistent Disk
+    disk:
+      name: sqlite-data
+      # Mount Path: Thư mục mà Render sẽ mount ổ đĩa vào. 
+      # Chúng ta sẽ dùng /data và thay đổi đường dẫn CSDL trong app.py
+      mountPath: /data
+      sizeGB: 0.1 # 100MB là đủ cho 1 file SQLite
