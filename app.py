@@ -20,10 +20,12 @@ from flask import (
 # =========================
 # CÁC THƯ VIỆN MỚI CHO EMAIL & SCHEDULER
 # =========================
-import smtplib  # ! MỚI: Để gửi email
-import ssl  # ! MỚI: Để gửi email
-from email.message import EmailMessage  # ! MỚI: Để gửi email
-from apscheduler.schedulers.background import BackgroundScheduler  # ! MỚI: Để lập lịch
+import smtplib
+import ssl
+from email.message import EmailMessage
+from apscheduler.schedulers.background import BackgroundScheduler
+import io  # ! MỚI: Để tạo file zip trong bộ nhớ
+import zipfile  # ! MỚI: Để tạo file zip có mật khẩu
 
 # =========================
 # CẤU HÌNH CƠ BẢN
@@ -1014,9 +1016,11 @@ def start_watcher_once():
         t.start()
 
 # =========================
-# ! MỚI: HELPER GỬI EMAIL (TÁCH RA)
+# ! CHỈNH SỬA: HELPER GỬI EMAIL (HỖ TRỢ ATTACHMENT)
 # =========================
-def send_email(to_email: str, subject: str, html_body: str) -> Optional[str]:
+def send_email(to_email: str, subject: str, html_body: str, 
+               attachment_data: Optional[bytes] = None, 
+               attachment_filename: Optional[str] = None) -> Optional[str]:
     """Gửi email và trả về string lỗi nếu thất bại, ngược lại trả về None."""
     
     settings = get_settings()
@@ -1039,6 +1043,13 @@ def send_email(to_email: str, subject: str, html_body: str) -> Optional[str]:
     msg['To'] = to_email
     msg.set_content("Vui lòng xem nội dung email bằng trình duyệt hỗ trợ HTML.")
     msg.add_alternative(html_body, subtype='html')
+    
+    # ! MỚI: Thêm file đính kèm nếu có
+    if attachment_data and attachment_filename:
+        msg.add_attachment(attachment_data, 
+                           maintype='application', 
+                           subtype='zip', 
+                           filename=attachment_filename)
 
     try:
         context = ssl.create_default_context()
@@ -1051,6 +1062,50 @@ def send_email(to_email: str, subject: str, html_body: str) -> Optional[str]:
         return str(e) # Thất bại
 
 # =========================
+# ! MỚI: TEMPLATE EMAIL TRANG TRỌNG
+# =========================
+def get_email_template(title: str, content_html: str) -> str:
+    """Tạo một email HTML trang trọng, bọc nội dung lại."""
+    return f"""
+    <!DOCTYPE html>
+    <html lang="vi">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>{title}</title>
+        <style>
+            body {{ margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; line-height: 1.6; color: #333; }}
+            .container {{ width: 90%; max-width: 600px; margin: 20px auto; border: 1px solid #e0e0e0; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }}
+            .header {{ background-color: #020817; color: #ffffff; padding: 24px 30px; }}
+            .header h1 {{ margin: 0; font-size: 24px; font-weight: 600; color: #f0f9ff; }}
+            .content {{ padding: 30px; }}
+            .content p {{ margin-bottom: 20px; color: #4a5568; }}
+            .content strong {{ color: #1a202c; }}
+            .button {{ display: inline-block; padding: 12px 20px; background-color: #4f46e5; color: #ffffff; text-decoration: none; border-radius: 8px; font-weight: 500; }}
+            .alert {{ padding: 16px; background-color: #fffbeb; border: 1px solid #fde68a; border-radius: 8px; margin-top: 20px; }}
+            .alert p {{ margin: 0; color: #92400e; }}
+            .footer {{ background-color: #f8f9fa; color: #718096; padding: 24px 30px; text-align: center; font-size: 12px; border-top: 1px solid #e0e0e0; }}
+            .footer p {{ margin: 0 0 5px 0; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>{title}</h1>
+            </div>
+            <div class="content">
+                {content_html}
+            </div>
+            <div class="footer">
+                <p><strong>{APP_TITLE}</strong></p>
+                <p>Bot được bảo dưỡng & phát triển bởi Admin Văn Linh.</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+# =========================
 # ! CHỈNH SỬA: TÁC VỤ GỬI BÁO CÁO HÀNG THÁNG
 # =========================
 def send_monthly_report():
@@ -1058,7 +1113,6 @@ def send_monthly_report():
     
     settings = get_settings()
 
-    # ! MỚI: Kiểm tra xem user có bật tính năng này không
     if settings.get("enable_monthly_report") != "1":
         print(f"[{datetime.now(VN_TZ)}] Monthly report is disabled by user. Skipping.")
         return
@@ -1078,20 +1132,19 @@ def send_monthly_report():
     start_utc = first_day_of_last_month.astimezone(timezone.utc).isoformat()
     end_utc = last_day_of_last_month.astimezone(timezone.utc).isoformat()
     
-    month_label = first_day_of_last_month.strftime("%m/%Y")
-    print(f"Generating report for month: {month_label}")
+    month_label = first_day_of_last_month.strftime("%m-%Y")
+    month_label_vn = first_day_of_last_month.strftime("%m/%Y")
+    print(f"Generating report for month: {month_label_vn}")
 
     # Query "Doanh thu" (tổng tiền nạp)
     total_revenue = 0.0
     total_spent = 0.0
-    details = []
     
     with db_lock:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
         
-        # Lấy tổng nạp (doanh thu) và tổng trừ (chi tiêu) theo từng API
         c.execute("""
             SELECT 
                 name,
@@ -1106,50 +1159,43 @@ def send_monthly_report():
         rows = c.fetchall()
         
     if not rows:
-        print(f"No data found for month {month_label}. Skipping email.")
+        print(f"No data found for month {month_label_vn}. Skipping email.")
         return
         
-    # Xây dựng nội dung Email
-    body_html = f"""
+    # --- ! MỚI: TẠO NỘI DUNG FILE HTML BÁO CÁO ---
+    report_html_content = f"""
     <html>
     <head>
+        <meta charset="UTF-8">
         <style>
-            body {{ font-family: Arial, sans-serif; line-height: 1.6; }}
-            .container {{ width: 90%; max-width: 600px; margin: 20px auto; border: 1px solid #ddd; border-radius: 8px; overflow: hidden; }}
-            .header {{ background-color: #020817; color: #fff; padding: 20px; text-align: center; }}
-            .header h1 {{ margin: 0; font-size: 24px; }}
-            .content {{ padding: 30px; }}
-            .content p {{ margin-bottom: 20px; }}
+            body {{ font-family: Arial, sans-serif; line-height: 1.6; margin: 20px; }}
+            h1 {{ color: #020817; }}
             table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
             th, td {{ border: 1px solid #ddd; padding: 10px; text-align: left; }}
             th {{ background-color: #f4f4f4; }}
             .total {{ font-weight: bold; font-size: 1.1em; }}
             .revenue {{ color: #28a745; }}
             .spent {{ color: #dc3545; }}
-            .footer {{ background-color: #f9f9f9; color: #777; padding: 20px; text-align: center; font-size: 12px; }}
+            .footer {{ margin-top: 20px; font-size: 12px; color: #777; }}
         </style>
     </head>
     <body>
-        <div class="container">
-            <div class="header">
-                <h1>Báo cáo Doanh thu Tháng {month_label}</h1>
-            </div>
-            <div class="content">
-                <p>Xin chào Admin,</p>
-                <p>Đây là báo cáo tổng kết biến động số dư (Doanh thu = Tổng tiền nạp)
-                   cho tất cả các API trong tháng <b>{month_label}</b>
-                   (từ {first_day_of_last_month.strftime('%d/%m/%Y')} đến {last_day_of_last_month.strftime('%d/%m/%Y')}).
-                </p>
-                
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Tên API</th>
-                            <th style="text-align: right;">Tổng nạp (Doanh thu)</th>
-                            <th style="text-align: right;">Tổng trừ (Chi tiêu)</th>
-                        </tr>
-                    </thead>
-                    <tbody>
+        <h1>Báo cáo Doanh thu Chi tiết Tháng {month_label_vn}</h1>
+        <p>
+            Báo cáo tổng kết biến động số dư (Doanh thu = Tổng tiền nạp)
+            cho tất cả các API trong tháng <b>{month_label_vn}</b>
+            (từ {first_day_of_last_month.strftime('%d/%m/%Y')} đến {last_day_of_last_month.strftime('%d/%m/%Y')}).
+        </p>
+        
+        <table>
+            <thead>
+                <tr>
+                    <th>Tên API</th>
+                    <th style="text-align: right;">Tổng nạp (Doanh thu)</th>
+                    <th style="text-align: right;">Tổng trừ (Chi tiêu)</th>
+                </tr>
+            </thead>
+            <tbody>
     """
 
     for row in rows:
@@ -1157,7 +1203,7 @@ def send_monthly_report():
         spent = float(row['spent'])
         total_revenue += revenue
         total_spent += spent
-        body_html += f"""
+        report_html_content += f"""
                         <tr>
                             <td>{row['name']}</td>
                             <td style="text-align: right;" class="revenue">+{fmt_amount(revenue)}</td>
@@ -1165,7 +1211,7 @@ def send_monthly_report():
                         </tr>
         """
     
-    body_html += f"""
+    report_html_content += f"""
                         <tr class="total">
                             <td>TỔNG CỘNG</td>
                             <td style="text-align: right;" class="revenue">+{fmt_amount(total_revenue)}</td>
@@ -1173,18 +1219,52 @@ def send_monthly_report():
                         </tr>
                     </tbody>
                 </table>
-            </div>
-            <div class="footer">
-                <p>Balance Watcher Universe | Bot được phát triển bởi Admin Văn Linh.</p>
-            </div>
+        <div class="footer">
+            <p>Balance Watcher Universe | Bot được phát triển bởi Admin Văn Linh.</p>
         </div>
     </body>
     </html>
     """
+    
+    # --- ! MỚI: TẠO FILE ZIP CÓ MẬT KHẨU ---
+    try:
+        admin_pass_bytes = ADMIN_PASSWORD.encode('utf-8')
+        zip_buffer = io.BytesIO()
 
-    # ! CHỈNH SỬA: Dùng helper send_email
-    subject = f"[Báo cáo] Tổng kết Doanh thu {APP_TITLE} tháng {month_label}"
-    error = send_email(report_email, subject, body_html)
+        # Tên file bên trong zip
+        report_filename_in_zip = f"BaoCao_Thang_{month_label}.html"
+        # Tên file zip đính kèm
+        report_filename_zip = f"BaoCao_Thang_{month_label}.zip"
+
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            zipf.setpassword(admin_pass_bytes)
+            zipf.writestr(report_filename_in_zip, report_html_content.encode('utf-8'))
+        
+        zip_data = zip_buffer.getvalue()
+    except Exception as e:
+        print(f"Failed to create password-protected zip file: {e}")
+        return
+
+    # --- ! MỚI: TẠO NỘI DUNG EMAIL THÔNG BÁO (TRANG TRỌNG) ---
+    email_subject = f"[Báo cáo] Tổng kết Doanh thu {APP_TITLE} tháng {month_label_vn}"
+    email_content_html = f"""
+    <p>Xin chào Admin,</p>
+    <p>Hệ thống <strong>{APP_TITLE}</strong> đã hoàn tất tổng kết và gửi báo cáo doanh thu cho tháng {month_label_vn}.</p>
+    <p>Báo cáo chi tiết được đính kèm trong tệp <strong>{report_filename_zip}</strong>.</p>
+    
+    <div class="alert">
+        <p><strong>BẢO MẬT:</strong> Tệp đính kèm đã được mã hóa. Vui lòng sử dụng <strong>mật khẩu admin (ADMIN_PASSWORD)</strong> của bạn để giải nén và xem báo cáo.</p>
+    </div>
+    
+    <p style="margin-top: 20px;">Trân trọng,<br>Hệ thống Bot Giám sát.</p>
+    """
+    
+    final_email_html = get_email_template(f"Báo cáo tháng {month_label_vn}", email_content_html)
+
+    # ! CHỈNH SỬA: Dùng helper send_email với file đính kèm
+    error = send_email(report_email, email_subject, final_email_html, 
+                       attachment_data=zip_data, 
+                       attachment_filename=report_filename_zip)
     
     if error:
         print(f"Failed to send monthly report email: {error}")
@@ -1380,7 +1460,7 @@ def test_bot():
     return redirect(url_for("dashboard"))
 
 # =========================
-# ! MỚI: ROUTE TEST EMAIL
+# ! CHỈNH SỬA: ROUTE TEST EMAIL (DÙNG TEMPLATE MỚI)
 # =========================
 @app.route("/test_email", methods=["POST"])
 def test_email():
@@ -1395,14 +1475,15 @@ def test_email():
         return redirect(url_for("dashboard"))
 
     subject = f"Email Test từ {APP_TITLE}"
-    html_body = f"""
-    <html><body>
-        <h1>Test thành công!</h1>
-        <p>Đây là email test tự động từ <b>{APP_TITLE}</b>.</p>
-        <p>Nếu bạn nhận được email này, cấu hình SMTP của bạn đã hoạt động chính xác.</p>
-        <p>Bot được phát triển bởi <b>Admin Văn Linh</b>.</p>
-    </body></html>
+    
+    # ! MỚI: Dùng template trang trọng
+    content_html = f"""
+    <p>Xin chào Admin,</p>
+    <p>Đây là email kiểm tra tự động từ hệ thống <strong>{APP_TITLE}</strong>.</p>
+    <p>Nếu bạn nhận được email này, cấu hình SMTP của bạn đã hoạt động chính xác và sẵn sàng gửi báo cáo.</p>
+    <p style="margin-top: 20px;">Trân trọng,<br>Hệ thống Bot Giám sát.</p>
     """
+    html_body = get_email_template("Kiểm tra Cấu hình Email", content_html)
     
     error = send_email(to_email, subject, html_body)
     
