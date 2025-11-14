@@ -24,8 +24,35 @@ import smtplib
 import ssl
 from email.message import EmailMessage
 from apscheduler.schedulers.background import BackgroundScheduler
-import io  # ! MỚI: Để tạo file zip trong bộ nhớ
-import zipfile  # ! MỚI: Để tạo file zip có mật khẩu
+import io
+# import zipfile # ! ĐÃ XÓA: Không cần nén zip nữa
+import socket # ! MỚI: Để bắt lỗi timeout
+
+# =========================
+# ! MỚI: CÁC THƯ VIỆN CHO BÁO CÁO PDF VÀ BIỂU ĐỒ
+# =========================
+try:
+    import pandas as pd
+    import matplotlib
+    matplotlib.use('Agg') # Chế độ chạy server-side, không cần GUI
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as mticker
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, PageBreak, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    
+    # Biến toàn cục để kiểm tra thư viện PDF
+    PDF_LIBS_LOADED = True
+except ImportError:
+    PDF_LIBS_LOADED = False
+    print("WARNING: PDF/Chart libraries (pandas, matplotlib, reportlab) not found.")
+    print("Please install them: pip install pandas matplotlib reportlab")
+
 
 # =========================
 # CẤU HÌNH CƠ BẢN
@@ -99,6 +126,17 @@ def fmt_amount(v: float) -> str:
             return f"{float(str(v).replace(',', '')):,.0f}đ"
         except Exception:
             return f"{v}đ"
+            
+# ! MỚI: Helper format tiền cho biểu đồ (1000000 -> 1tr)
+def fmt_amount_short(v: float, pos=None):
+    if v >= 1_000_000_000:
+        return f'{v/1_000_000_000:1.1f} tỷ'
+    if v >= 1_000_000:
+        return f'{v/1_000_000:1.1f} tr'
+    if v >= 1_000:
+        return f'{v/1_000:1.0f} k'
+    return f'{v:1.0f}'
+
 
 def to_float(s: Optional[str], default: Optional[float] = None) -> Optional[float]:
     try:
@@ -376,7 +414,7 @@ DASHBOARD_TEMPLATE = r"""
                             <label class="block text-[10px] text-slate-400 mb-1">SMTP Port</label>
                             <input type="number" name="smtp_port"
                                 value="{{ settings.smtp_port or '' }}"
-                                placeholder="587"
+                                placeholder="587 (TLS) hoặc 465 (SSL)"
                                 class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-yellow-500 focus:border-yellow-400">
                         </div>
                         <div>
@@ -1016,7 +1054,7 @@ def start_watcher_once():
         t.start()
 
 # =========================
-# ! CHỈNH SỬA: HELPER GỬI EMAIL (HỖ TRỢ ATTACHMENT)
+# ! CHỈNH SỬA: HELPER GỬI EMAIL (TỰ ĐỘNG PHÁT HIỆN LOẠI FILE)
 # =========================
 def send_email(to_email: str, subject: str, html_body: str, 
                attachment_data: Optional[bytes] = None, 
@@ -1046,20 +1084,46 @@ def send_email(to_email: str, subject: str, html_body: str,
     
     # ! MỚI: Thêm file đính kèm nếu có
     if attachment_data and attachment_filename:
+        # Tự động phát hiện kiểu file
+        maintype = 'application'
+        subtype = 'octet-stream' # Mặc định
+        if attachment_filename.lower().endswith('.zip'):
+            subtype = 'zip'
+        elif attachment_filename.lower().endswith('.pdf'):
+            subtype = 'pdf'
+            
         msg.add_attachment(attachment_data, 
-                           maintype='application', 
-                           subtype='zip', 
+                           maintype=maintype, 
+                           subtype=subtype, 
                            filename=attachment_filename)
 
     try:
+        # ! CHỈNH SỬA QUAN TRỌNG: Thêm timeout=10
+        # và tự động chọn SSL (465) hay TLS (587)
+        
         context = ssl.create_default_context()
-        with smtplib.SMTP(smtp_server, smtp_port) as server:
-            server.starttls(context=context)
-            server.login(smtp_user, smtp_pass)
-            server.send_message(msg)
+        
+        if smtp_port == 465:
+            # Dùng SSL cho cổng 465
+            with smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=10, context=context) as server:
+                server.login(smtp_user, smtp_pass)
+                server.send_message(msg)
+        else:
+            # Dùng TLS (STARTTLS) cho các cổng khác (như 587)
+            with smtplib.SMTP(smtp_server, smtp_port, timeout=10) as server:
+                server.starttls(context=context)
+                server.login(smtp_user, smtp_pass)
+                server.send_message(msg)
+                
         return None  # Thành công
+        
+    except smtplib.SMTPException as e:
+        return f"Lỗi SMTP: {e}" # Lỗi cụ thể (sai pass, v.v.)
+    except socket.timeout:
+        return f"Kết nối đến {smtp_server}:{smtp_port} bị timeout. Vui lòng kiểm tra lại Cổng (Port) hoặc thử đổi sang cổng 465/587."
     except Exception as e:
-        return str(e) # Thất bại
+        return f"Lỗi không xác định: {e}" # Các lỗi khác
+
 
 # =========================
 # ! MỚI: TEMPLATE EMAIL TRANG TRỌNG
@@ -1106,11 +1170,17 @@ def get_email_template(title: str, content_html: str) -> str:
     """
 
 # =========================
-# ! CHỈNH SỬA: TÁC VỤ GỬI BÁO CÁO HÀNG THÁNG
+# ! CHỈNH SỬA LỚN: TÁC VỤ GỬI BÁO CÁO PDF HÀNG THÁNG
 # =========================
 def send_monthly_report():
     print(f"[{datetime.now(VN_TZ)}] Running monthly report job...")
     
+    # Kiểm tra xem các thư viện PDF đã được load chưa
+    if not PDF_LIBS_LOADED:
+        print("ERROR: PDF libraries not found. Skipping monthly report.")
+        print("Please run: pip install pandas matplotlib reportlab")
+        return
+
     settings = get_settings()
 
     if settings.get("enable_monthly_report") != "1":
@@ -1136,124 +1206,222 @@ def send_monthly_report():
     month_label_vn = first_day_of_last_month.strftime("%m/%Y")
     print(f"Generating report for month: {month_label_vn}")
 
-    # Query "Doanh thu" (tổng tiền nạp)
-    total_revenue = 0.0
-    total_spent = 0.0
-    
+    # Query tất cả lịch sử giao dịch trong tháng
     with db_lock:
         conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
         c = conn.cursor()
-        
-        c.execute("""
-            SELECT 
-                name,
-                SUM(CASE WHEN change_amount > 0 THEN change_amount ELSE 0 END) as revenue,
-                SUM(CASE WHEN change_amount < 0 THEN change_amount ELSE 0 END) as spent
-            FROM balance_history
-            WHERE timestamp >= ? AND timestamp <= ?
-            GROUP BY api_id, name
-            ORDER BY name
-        """, (start_utc, end_utc))
-        
+        c.execute(
+            "SELECT timestamp, name, change_amount, new_balance FROM balance_history WHERE timestamp >= ? AND timestamp <= ?",
+            (start_utc, end_utc)
+        )
         rows = c.fetchall()
         
     if not rows:
         print(f"No data found for month {month_label_vn}. Skipping email.")
         return
         
-    # --- ! MỚI: TẠO NỘI DUNG FILE HTML BÁO CÁO ---
-    report_html_content = f"""
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <style>
-            body {{ font-family: Arial, sans-serif; line-height: 1.6; margin: 20px; }}
-            h1 {{ color: #020817; }}
-            table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
-            th, td {{ border: 1px solid #ddd; padding: 10px; text-align: left; }}
-            th {{ background-color: #f4f4f4; }}
-            .total {{ font-weight: bold; font-size: 1.1em; }}
-            .revenue {{ color: #28a745; }}
-            .spent {{ color: #dc3545; }}
-            .footer {{ margin-top: 20px; font-size: 12px; color: #777; }}
-        </style>
-    </head>
-    <body>
-        <h1>Báo cáo Doanh thu Chi tiết Tháng {month_label_vn}</h1>
-        <p>
-            Báo cáo tổng kết biến động số dư (Doanh thu = Tổng tiền nạp)
-            cho tất cả các API trong tháng <b>{month_label_vn}</b>
-            (từ {first_day_of_last_month.strftime('%d/%m/%Y')} đến {last_day_of_last_month.strftime('%d/%m/%Y')}).
-        </p>
-        
-        <table>
-            <thead>
-                <tr>
-                    <th>Tên API</th>
-                    <th style="text-align: right;">Tổng nạp (Doanh thu)</th>
-                    <th style="text-align: right;">Tổng trừ (Chi tiêu)</th>
-                </tr>
-            </thead>
-            <tbody>
-    """
-
-    for row in rows:
-        revenue = float(row['revenue'])
-        spent = float(row['spent'])
-        total_revenue += revenue
-        total_spent += spent
-        report_html_content += f"""
-                        <tr>
-                            <td>{row['name']}</td>
-                            <td style="text-align: right;" class="revenue">+{fmt_amount(revenue)}</td>
-                            <td style="text-align: right;" class="spent">{fmt_amount(spent)}</td>
-                        </tr>
-        """
-    
-    report_html_content += f"""
-                        <tr class="total">
-                            <td>TỔNG CỘNG</td>
-                            <td style="text-align: right;" class="revenue">+{fmt_amount(total_revenue)}</td>
-                            <td style="text-align: right;" class="spent">{fmt_amount(total_spent)}</td>
-                        </tr>
-                    </tbody>
-                </table>
-        <div class="footer">
-            <p>Balance Watcher Universe | Bot được phát triển bởi Admin Văn Linh.</p>
-        </div>
-    </body>
-    </html>
-    """
-    
-    # --- ! MỚI: TẠO FILE ZIP CÓ MẬT KHẨU ---
+    # --- 1. XỬ LÝ DATA BẰNG PANDAS ---
     try:
-        admin_pass_bytes = ADMIN_PASSWORD.encode('utf-8')
-        zip_buffer = io.BytesIO()
-
-        # Tên file bên trong zip
-        report_filename_in_zip = f"BaoCao_Thang_{month_label}.html"
-        # Tên file zip đính kèm
-        report_filename_zip = f"BaoCao_Thang_{month_label}.zip"
-
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            zipf.setpassword(admin_pass_bytes)
-            zipf.writestr(report_filename_in_zip, report_html_content.encode('utf-8'))
+        df = pd.DataFrame(rows, columns=['timestamp', 'name', 'change_amount', 'new_balance'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df['timestamp_vn'] = df['timestamp'].dt.tz_convert(VN_TZ)
+        df['change_amount'] = pd.to_numeric(df['change_amount'])
         
-        zip_data = zip_buffer.getvalue()
+        df_revenue = df[df['change_amount'] > 0]
+        df_spent = df[df['change_amount'] < 0]
+        
+        # Tổng hợp Doanh thu / Chi tiêu
+        total_revenue = df_revenue['change_amount'].sum()
+        total_spent = df_spent['change_amount'].sum()
+
+        # Dữ liệu cho biểu đồ
+        daily_revenue = df_revenue.set_index('timestamp_vn').resample('D')['change_amount'].sum()
+        weekly_revenue = df_revenue.set_index('timestamp_vn').resample('W-MON', label='left', closed='left')['change_amount'].sum()
+        revenue_by_api = df_revenue.groupby('name')['change_amount'].sum()
+
     except Exception as e:
-        print(f"Failed to create password-protected zip file: {e}")
+        print(f"Error processing data with pandas: {e}")
         return
 
-    # --- ! MỚI: TẠO NỘI DUNG EMAIL THÔNG BÁO (TRANG TRỌNG) ---
+    # --- 2. VẼ BIỂU ĐỒ BẰNG MATPLOTLIB ---
+    chart_buffers = {}
+    try:
+        plt.style.use('seaborn-v0_8-darkgrid')
+        
+        # Biểu đồ 1: Doanh thu theo API (Pie chart)
+        if not revenue_by_api.empty:
+            fig1, ax1 = plt.subplots(figsize=(8, 5))
+            # Lọc API có doanh thu < 1%
+            total = revenue_by_api.sum()
+            threshold = total * 0.01
+            small_slices = revenue_by_api[revenue_by_api < threshold]
+            main_slices = revenue_by_api[revenue_by_api >= threshold]
+            
+            if not small_slices.empty:
+                main_slices['Khác (<1%)'] = small_slices.sum()
+
+            wedges, texts, autotexts = ax1.pie(
+                main_slices, 
+                autopct='%1.1f%%', 
+                startangle=90,
+                pctdistance=0.85
+            )
+            ax1.axis('equal')
+            plt.setp(autotexts, size=8, weight="bold", color="white")
+            ax1.legend(wedges, main_slices.index, title="API", loc="center left", bbox_to_anchor=(1, 0, 0.5, 1))
+            plt.title(f'Tỷ trọng Doanh thu theo API - Tháng {month_label_vn}', pad=20)
+            
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', bbox_inches='tight')
+            chart_buffers['api_pie'] = buf
+            plt.close(fig1)
+
+        # Biểu đồ 2: Doanh thu theo ngày (Line chart)
+        if not daily_revenue.empty:
+            fig2, ax2 = plt.subplots(figsize=(10, 5))
+            daily_revenue.plot(kind='line', ax=ax2, marker='o', markersize=4)
+            ax2.set_title(f'Doanh thu hàng ngày - Tháng {month_label_vn}')
+            ax2.set_xlabel('Ngày')
+            ax2.set_ylabel('Doanh thu (VND)')
+            ax2.yaxis.set_major_formatter(mticker.FuncFormatter(fmt_amount_short))
+            plt.xticks(rotation=45)
+            plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+            
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', bbox_inches='tight')
+            chart_buffers['daily_line'] = buf
+            plt.close(fig2)
+
+        # Biểu đồ 3: Doanh thu theo tuần (Bar chart)
+        if not weekly_revenue.empty:
+            fig3, ax3 = plt.subplots(figsize=(10, 5))
+            weekly_revenue.plot(kind='bar', ax=ax3, width=0.8)
+            ax3.set_title(f'Tổng doanh thu hàng tuần - Tháng {month_label_vn}')
+            ax3.set_xlabel('Tuần (Bắt đầu từ thứ 2)')
+            ax3.set_ylabel('Doanh thu (VND)')
+            ax3.yaxis.set_major_formatter(mticker.FuncFormatter(fmt_amount_short))
+            ax3.set_xticklabels([d.strftime('%d/%m') for d in weekly_revenue.index], rotation=45)
+
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', bbox_inches='tight')
+            chart_buffers['weekly_bar'] = buf
+            plt.close(fig3)
+
+    except Exception as e:
+        print(f"Error generating charts: {e}")
+        plt.close('all') # Đảm bảo dọn dẹp
+        return
+
+    # --- 3. TẠO FILE PDF BẰNG REPORTLAB ---
+    pdf_buffer = io.BytesIO()
+    pdf_filename = f"BaoCao_PDF_Thang_{month_label}.pdf" # ! MỚI: Đặt tên file ở đây
+    try:
+        # ! CHỈNH SỬA: Thêm encrypt=ADMIN_PASSWORD
+        doc = SimpleDocTemplate(
+            pdf_buffer, 
+            pagesize=A4, 
+            topMargin=0.5*inch, 
+            bottomMargin=0.5*inch, 
+            leftMargin=0.75*inch, 
+            rightMargin=0.75*inch,
+            encrypt=ADMIN_PASSWORD # Đây là mật khẩu PDF
+        )
+        story = []
+        styles = getSampleStyleSheet()
+        
+        # Định nghĩa styles
+        style_h1 = ParagraphStyle(name='Heading1', fontSize=18, alignment=TA_CENTER, spaceBottom=20, fontName="Helvetica-Bold")
+        style_h2 = ParagraphStyle(name='Heading2', fontSize=14, fontName="Helvetica-Bold", spaceBefore=20, spaceBottom=10)
+        style_body = styles['BodyText']
+        style_body_right = ParagraphStyle(name='BodyRight', alignment=TA_RIGHT)
+
+        # Trang 1: Trang bìa & Tổng quan
+        story.append(Paragraph(f"BÁO CÁO TỔNG KẾT THÁNG {month_label_vn}", style_h1))
+        story.append(Paragraph(f"Hệ thống: {APP_TITLE}", styles['Normal']))
+        story.append(Paragraph(f"Ngày lập báo cáo: {datetime.now(VN_TZ).strftime('%H:%M %d/%m/%Y')}", styles['Normal']))
+        
+        story.append(Spacer(1, 0.25*inch))
+        
+        # Bảng tổng kết
+        summary_data = [
+            ['Hạng mục', 'Số tiền'],
+            [Paragraph('<b>Tổng Doanh thu (Tiền nạp)</b>', style_body), 
+             Paragraph(f'<b>{fmt_amount(total_revenue)}</b>', style_body_right)],
+            [Paragraph('<b>Tổng Chi tiêu (Tiền trừ)</b>', style_body), 
+             Paragraph(f'<b>{fmt_amount(total_spent)}</b>', style_body_right)],
+        ]
+        summary_table = Table(summary_data, colWidths=[doc.width/2.0]*2)
+        summary_table.setStyle(TableStyle([
+            ('GRID', (0,0), (-1,-1), 1, colors.HexColor("#020817")),
+            ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#020817")),
+            ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+            ('BACKGROUND', (0,1), (-1,1), colors.HexColor("#cffade")), # Doanh thu
+            ('BACKGROUND', (0,2), (-1,2), colors.HexColor("#fef2f2")), # Chi tiêu
+            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+            ('PADDING', (0,0), (-1,-1), 8),
+        ]))
+        story.append(summary_table)
+
+        # Thêm biểu đồ
+        if 'api_pie' in chart_buffers:
+            story.append(Paragraph("Biểu đồ Tỷ trọng Doanh thu theo API", style_h2))
+            chart_buffers['api_pie'].seek(0)
+            story.append(Image(chart_buffers['api_pie'], width=7*inch, height=4.3*inch, kind='proportional'))
+        
+        if 'daily_line' in chart_buffers:
+            story.append(Paragraph("Biểu đồ Doanh thu theo Ngày", style_h2))
+            chart_buffers['daily_line'].seek(0)
+            story.append(Image(chart_buffers['daily_line'], width=7*inch, height=3.5*inch, kind='proportional'))
+
+        if 'weekly_bar' in chart_buffers:
+            story.append(Paragraph("Biểu đồ Doanh thu theo Tuần", style_h2))
+            chart_buffers['weekly_bar'].seek(0)
+            story.append(Image(chart_buffers['weekly_bar'], width=7*inch, height=3.5*inch, kind='proportional'))
+
+        # Trang 2: Lịch sử giao dịch chi tiết
+        story.append(PageBreak())
+        story.append(Paragraph("Lịch sử Giao dịch Chi tiết", style_h1))
+        
+        # Chuẩn bị data cho bảng
+        df_display = df.sort_values(by='timestamp', ascending=False)
+        df_display['timestamp_vn_str'] = df_display['timestamp_vn'].dt.strftime('%H:%M %d/%m/%Y')
+        df_display['change_amount_str'] = df_display['change_amount'].apply(fmt_amount)
+        df_display['new_balance_str'] = df_display['new_balance'].apply(fmt_amount)
+        
+        table_data = [
+            ['Thời gian (VN)', 'Tên API', 'Biến động', 'Số dư cuối']
+        ]
+        table_data.extend(df_display[['timestamp_vn_str', 'name', 'change_amount_str', 'new_balance_str']].values.tolist())
+        
+        log_table = Table(table_data, colWidths=[1.8*inch, 2.7*inch, 1.25*inch, 1.25*inch])
+        log_table.setStyle(TableStyle([
+            ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
+            ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#020817")),
+            ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0,1), (-1,-1), 8),
+            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+            ('PADDING', (0,0), (-1,-1), 4),
+        ]))
+        story.append(log_table)
+
+        doc.build(story)
+        
+    except Exception as e:
+        print(f"Error generating PDF: {e}")
+        return
+
+    # --- 4. TẠO EMAIL VÀ GỬI --- (ĐÃ XÓA PHẦN NÉN ZIP)
+    
     email_subject = f"[Báo cáo] Tổng kết Doanh thu {APP_TITLE} tháng {month_label_vn}"
     email_content_html = f"""
     <p>Xin chào Admin,</p>
-    <p>Hệ thống <strong>{APP_TITLE}</strong> đã hoàn tất tổng kết và gửi báo cáo doanh thu cho tháng {month_label_vn}.</p>
-    <p>Báo cáo chi tiết được đính kèm trong tệp <strong>{report_filename_zip}</strong>.</p>
+    <p>Hệ thống <strong>{APP_TITLE}</strong> đã hoàn tất tổng kết và gửi báo cáo doanh thu PDF cho tháng {month_label_vn}.</p>
+    <p>Báo cáo chi tiết (bao gồm biểu đồ và lịch sử giao dịch) được đính kèm trong tệp <strong>{pdf_filename}</strong>.</p>
     
     <div class="alert">
-        <p><strong>BẢO MẬT:</strong> Tệp đính kèm đã được mã hóa. Vui lòng sử dụng <strong>mật khẩu admin (ADMIN_PASSWORD)</strong> của bạn để giải nén và xem báo cáo.</p>
+        <p><strong>BẢO MẬT:</strong> Tệp PDF đính kèm đã được mã hóa. Vui lòng sử dụng <strong>mật khẩu admin (ADMIN_PASSWORD)</strong> của bạn để mở file và xem báo cáo.</p>
     </div>
     
     <p style="margin-top: 20px;">Trân trọng,<br>Hệ thống Bot Giám sát.</p>
@@ -1261,10 +1429,10 @@ def send_monthly_report():
     
     final_email_html = get_email_template(f"Báo cáo tháng {month_label_vn}", email_content_html)
 
-    # ! CHỈNH SỬA: Dùng helper send_email với file đính kèm
+    # ! CHỈNH SỬA: Gửi trực tiếp PDF data
     error = send_email(report_email, email_subject, final_email_html, 
-                       attachment_data=zip_data, 
-                       attachment_filename=report_filename_zip)
+                       attachment_data=pdf_buffer.getvalue(), 
+                       attachment_filename=pdf_filename)
     
     if error:
         print(f"Failed to send monthly report email: {error}")
@@ -1393,7 +1561,6 @@ def save_settings():
         set_setting("smtp_pass", smtp_pass)
 
     # ! MỚI: Lưu cài đặt enable/disable
-    # request.form.get('checkbox_name') trả về 'value' (VD: '1') nếu được check, và None nếu không.
     enable_report = "1" if request.form.get("enable_monthly_report") else "0"
     set_setting("enable_monthly_report", enable_report)
 
@@ -1485,7 +1652,8 @@ def test_email():
     """
     html_body = get_email_template("Kiểm tra Cấu hình Email", content_html)
     
-    error = send_email(to_email, subject, html_body)
+    # Gửi email test KHÔNG CÓ file đính kèm
+    error = send_email(to_email, subject, html_body, None, None)
     
     if error:
         flash(f"Gửi email test thất bại: {error}", "error")
@@ -1687,6 +1855,20 @@ def health():
 # KHỞI ĐỘNG
 # =========================
 def init_and_run():
+    # ! MỚI: Đặt font mặc định cho matplotlib (hỗ trợ tiếng Việt)
+    if PDF_LIBS_LOADED:
+        try:
+            # Linux/Render thường có font này
+            plt.rcParams['font.family'] = 'DejaVu Sans'
+            # Đăng ký font cơ bản cho ReportLab
+            # (DejaVu Sans không dễ để nhúng, dùng font Helvetica mặc định của PDF)
+            # ReportLab sẽ tự dùng font thay thế nếu ký tự không có,
+            # nhưng tốt nhất là dùng từ ngữ không dấu trong biểu đồ nếu được.
+            # Đối với hỗ trợ Tiếng Việt đầy đủ, cần nhúng font .ttf
+            pass
+        except Exception as e:
+            print(f"Warning: Could not set default font. {e}")
+        
     init_db()
     start_watcher_once()
     
