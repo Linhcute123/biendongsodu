@@ -18,6 +18,14 @@ from flask import (
 )
 
 # =========================
+# CÁC THƯ VIỆN MỚI CHO EMAIL & SCHEDULER
+# =========================
+import smtplib  # ! MỚI: Để gửi email
+import ssl  # ! MỚI: Để gửi email
+from email.message import EmailMessage  # ! MỚI: Để gửi email
+from apscheduler.schedulers.background import BackgroundScheduler  # ! MỚI: Để lập lịch
+
+# =========================
 # CẤU HÌNH CƠ BẢN
 # =========================
 
@@ -286,9 +294,7 @@ DASHBOARD_TEMPLATE = r"""
     </div>
 
     <div class="max-w-6xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-5 items-start">
-        <!-- Cột trái: Settings + Bots + Backup/Restore -->
         <div class="space-y-5">
-            <!-- Cài đặt chung -->
             <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
                 <div class="flex items-center justify-between gap-2 mb-3">
                     <h2 class="text-sm font-semibold text-indigo-300 uppercase tracking-[0.16em]">Cài đặt chung</h2>
@@ -296,54 +302,111 @@ DASHBOARD_TEMPLATE = r"""
                         Telegram: 1 Chat ID, nhiều Bot Token
                     </span>
                 </div>
-                <form method="post" action="{{ url_for('save_settings') }}" class="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    <div class="md:col-span-2">
-                        <label class="block text-[10px] text-slate-400 mb-1">TELEGRAM_CHAT_ID (nhận cảnh báo)</label>
-                        <input type="text" name="default_chat_id"
-                            value="{{ settings.default_chat_id or '' }}"
-                            placeholder="VD: 123456789 hoặc -100123456789"
-                            class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-400">
-                    </div>
+                
+                <form method="post" action="{{ url_for('save_settings') }}" class="space-y-3">
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        <div class="md:col-span-2">
+                            <label class="block text-[10px] text-slate-400 mb-1">TELEGRAM_CHAT_ID (nhận cảnh báo)</label>
+                            <input type="text" name="default_chat_id"
+                                value="{{ settings.default_chat_id or '' }}"
+                                placeholder="VD: 123456789 hoặc -100123456789"
+                                class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-400">
+                        </div>
 
-                    <div>
-                        <label class="block text-[10px] text-slate-400 mb-1">Bot mặc định để gửi (tuỳ chọn)</label>
-                        <select name="default_bot_id"
-                            class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-400">
-                            <option value="">-- Gửi bằng TẤT CẢ bot --</option>
-                            {% for bot in bots %}
-                                <option value="{{ bot.id }}" {% if settings.default_bot_id and settings.default_bot_id == bot.id %}selected{% endif %}>
-                                    {{ bot.bot_name }} (..{{ bot.bot_token[-6:] }})
-                                </option>
-                            {% endfor %}
-                        </select>
-                    </div>
+                        <div>
+                            <label class="block text-[10px] text-slate-400 mb-1">Bot mặc định để gửi (tuỳ chọn)</label>
+                            <select name="default_bot_id"
+                                class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-400">
+                                <option value="">-- Gửi bằng TẤT CẢ bot --</option>
+                                {% for bot in bots %}
+                                    <option value="{{ bot.id }}" {% if settings.default_bot_id and settings.default_bot_id == bot.id %}selected{% endif %}>
+                                        {{ bot.bot_name }} (..{{ bot.bot_token[-6:] }})
+                                    </option>
+                                {% endfor %}
+                            </select>
+                        </div>
 
-                    <div>
-                        <label class="block text-[10px] text-slate-400 mb-1">Chu kỳ quét (giây)</label>
-                        <input type="number" min="5" step="1" name="poll_interval"
-                            value="{{ settings.poll_interval or '' }}"
-                            placeholder="VD: 15, 30, 60..."
-                            class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-400">
-                    </div>
+                        <div>
+                            <label class="block text-[10px] text-slate-400 mb-1">Chu kỳ quét (giây)</label>
+                            <input type="number" min="5" step="1" name="poll_interval"
+                                value="{{ settings.poll_interval or '' }}"
+                                placeholder="VD: 15, 30, 60..."
+                                class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-400">
+                        </div>
 
-                    <div>
-                        <label class="block text-[10px] text-slate-400 mb-1">Ngưỡng cảnh báo chung (VND)</label>
-                        <input type="text" name="global_threshold"
-                            value="{{ settings.global_threshold or '' }}"
-                            placeholder="VD: 1,000,000 (bỏ trống nếu không cảnh báo)"
-                            class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-rose-500 focus:border-rose-400">
+                        <div class="md:col-span-2">
+                            <label class="block text-[10px] text-slate-400 mb-1">Ngưỡng cảnh báo chung (VND)</label>
+                            <input type="text" name="global_threshold"
+                                value="{{ settings.global_threshold or '' }}"
+                                placeholder="VD: 1,000,000 (bỏ trống nếu không cảnh báo)"
+                                class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-rose-500 focus:border-rose-400">
+                        </div>
                     </div>
+                    
+                    <hr class="border-slate-700/60 my-4">
+                    <h3 class="text-sm font-semibold text-yellow-300 uppercase tracking-[0.16em] mb-3">Cài đặt Báo cáo Email</h3>
+                    
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        <div class="md:col-span-2">
+                            <label class="inline-flex items-center gap-2 text-[11px] text-slate-300">
+                                <input type="checkbox" name="enable_monthly_report" value="1" 
+                                       class="rounded border-slate-600 bg-slate-900 text-yellow-500 focus:ring-yellow-500"
+                                       {% if settings.enable_monthly_report %}checked{% endif %}>
+                                Bật tự động gửi báo cáo tổng kết vào cuối tháng
+                            </label>
+                        </div>
 
-                    <div class="md:col-span-2">
-                        <button type="submit"
-                            class="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-gradient-to-r from-indigo-500 via-sky-500 to-fuchsia-500 text-white text-[11px] font-medium shadow-lg hover:-translate-y-0.5 hover:shadow-xl transition-all">
-                            💾 Lưu cấu hình
-                        </button>
+                        <div>
+                            <label class="block text-[10px] text-slate-400 mb-1">Email nhận báo cáo</label>
+                            <input type="email" name="report_email"
+                                value="{{ settings.report_email or '' }}"
+                                placeholder="admin@gmail.com"
+                                class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-yellow-500 focus:border-yellow-400">
+                        </div>
+                        <div>
+                            <label class="block text-[10px] text-slate-400 mb-1">SMTP Server</label>
+                            <input type="text" name="smtp_server"
+                                value="{{ settings.smtp_server or '' }}"
+                                placeholder="smtp.gmail.com"
+                                class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-yellow-500 focus:border-yellow-400">
+                        </div>
+                        <div>
+                            <label class="block text-[10px] text-slate-400 mb-1">SMTP Port</label>
+                            <input type="number" name="smtp_port"
+                                value="{{ settings.smtp_port or '' }}"
+                                placeholder="587"
+                                class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-yellow-500 focus:border-yellow-400">
+                        </div>
+                        <div>
+                            <label class="block text-[10px] text-slate-400 mb-1">Email gửi (SMTP Username)</label>
+                            <input type="email" name="smtp_user"
+                                value="{{ settings.smtp_user or '' }}"
+                                placeholder="bot-report@gmail.com"
+                                class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-yellow-500 focus:border-yellow-400">
+                        </div>
+                        <div class="md:col-span-2">
+                            <label class="block text-[10px] text-slate-400 mb-1">Mật khẩu gửi (SMTP Password)</label>
+                            <input type="password" name="smtp_pass"
+                                placeholder="Dùng Mật khẩu ứng dụng nếu là Gmail"
+                                class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-yellow-500 focus:border-yellow-400">
+                        </div>
                     </div>
+                    <hr class="border-slate-700/60 my-4">
+                    
+                    <button type="submit"
+                        class="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-gradient-to-r from-indigo-500 via-sky-500 to-fuchsia-500 text-white text-[11px] font-medium shadow-lg hover:-translate-y-0.5 hover:shadow-xl transition-all">
+                        💾 Lưu toàn bộ cấu hình
+                    </button>
+                </form>
+
+                <form method="post" action="{{ url_for('test_email') }}" class="mt-3">
+                    <button type="submit" 
+                            class="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-gradient-to-r from-yellow-500 to-orange-600 text-white text-[11px] font-medium shadow-lg hover:-translate-y-0.5 hover:shadow-xl transition-all">
+                        ✉️ Gửi Email Test (sử dụng cấu hình đã lưu)
+                    </button>
                 </form>
             </div>
 
-            <!-- Quản lý Bot -->
             <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
                 <div class="flex items-center justify-between mb-3">
                     <h2 class="text-sm font-semibold text-cyan-300 uppercase tracking-[0.16em]">Quản lý Bot Telegram</h2>
@@ -397,7 +460,6 @@ DASHBOARD_TEMPLATE = r"""
                 </div>
             </div>
 
-            <!-- Backup & Restore -->
             <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
                 <div class="flex items-center justify-between mb-3">
                     <h2 class="text-sm font-semibold text-fuchsia-300 uppercase tracking-[0.16em]">Backup / Restore</h2>
@@ -440,9 +502,7 @@ DASHBOARD_TEMPLATE = r"""
             </div>
         </div>
 
-        <!-- Cột phải: Danh sách API -->
         <div class="lg:col-span-2 space-y-5">
-            <!-- Thêm API mới -->
             <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
                 <div class="flex items-center justify-between gap-2 mb-3">
                     <h2 class="text-sm font-semibold text-sky-300 uppercase tracking-[0.16em]">Thêm API số dư</h2>
@@ -478,7 +538,6 @@ DASHBOARD_TEMPLATE = r"""
                 </form>
             </div>
 
-            <!-- Danh sách API -->
             <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
                 <div class="flex items-center justify-between mb-3">
                     <h2 class="text-sm font-semibold text-indigo-300 uppercase tracking-[0.16em]">Danh sách API đang theo dõi</h2>
@@ -570,8 +629,13 @@ def init_db():
         )
         """)
 
-        # Khởi tạo key mặc định nếu chưa có
-        for k in ["default_chat_id", "default_bot_id", "last_run", "poll_interval", "global_threshold"]:
+        # ! CHỈNH SỬA: Thêm keys cho email + enable/disable
+        setting_keys = [
+            "default_chat_id", "default_bot_id", "last_run", "poll_interval", "global_threshold",
+            "report_email", "smtp_server", "smtp_port", "smtp_user", "smtp_pass",
+            "enable_monthly_report" #! MỚI
+        ]
+        for k in setting_keys:
             c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, '')", (k,))
 
         c.execute("""
@@ -582,6 +646,19 @@ def init_db():
             balance_field TEXT NOT NULL,
             last_balance REAL,
             last_change TEXT
+        )
+        """)
+
+        # ! MỚI: Bảng lưu lịch sử giao dịch để tính doanh thu
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS balance_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            api_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            change_amount REAL NOT NULL,
+            new_balance REAL NOT NULL,
+            FOREIGN KEY(api_id) REFERENCES apis(id) ON DELETE CASCADE
         )
         """)
 
@@ -664,6 +741,7 @@ def delete_api_db(api_id: int):
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("DELETE FROM apis WHERE id=?", (api_id,))
+        c.execute("DELETE FROM balance_history WHERE api_id=?", (api_id,)) #! MỚI: Xoá lịch sử
         conn.commit()
         conn.close()
 
@@ -677,6 +755,20 @@ def update_api_state(api_id: int, balance: float, changed_at: str):
         )
         conn.commit()
         conn.close()
+
+# ! MỚI: Hàm lưu lịch sử giao dịch
+def log_transaction(api_id: int, name: str, timestamp: str, change_amount: float, new_balance: float):
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO balance_history (api_id, name, timestamp, change_amount, new_balance) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (api_id, name, timestamp, change_amount, new_balance)
+        )
+        conn.commit()
+        conn.close()
+
 
 def wipe_table(table: str):
     with db_lock:
@@ -877,6 +969,9 @@ def watcher_loop():
                         send_telegram(tokens_to_use, default_chat_id, msg)
 
                     update_api_state(api_id, new_balance, now.isoformat() + "Z")
+                    
+                    # ! MỚI: Log giao dịch vào DB
+                    log_transaction(api_id, name, now.isoformat() + "Z", diff, new_balance)
                 else:
                     update_api_state(api_id, new_balance, api.get("last_change") or now.isoformat() + "Z")
 
@@ -919,6 +1014,185 @@ def start_watcher_once():
         t.start()
 
 # =========================
+# ! MỚI: HELPER GỬI EMAIL (TÁCH RA)
+# =========================
+def send_email(to_email: str, subject: str, html_body: str) -> Optional[str]:
+    """Gửi email và trả về string lỗi nếu thất bại, ngược lại trả về None."""
+    
+    settings = get_settings()
+    smtp_server = (settings.get("smtp_server") or "").strip()
+    smtp_port_str = (settings.get("smtp_port") or "").strip()
+    smtp_user = (settings.get("smtp_user") or "").strip()
+    smtp_pass = (settings.get("smtp_pass") or "").strip()
+
+    if not all([to_email, smtp_server, smtp_port_str, smtp_user, smtp_pass]):
+        return "Thiếu thông tin cấu hình SMTP (Server, Port, User, Pass)."
+
+    try:
+        smtp_port = int(smtp_port_str)
+    except ValueError:
+        return f"SMTP Port không hợp lệ: {smtp_port_str}."
+
+    msg = EmailMessage()
+    msg['Subject'] = subject
+    msg['From'] = smtp_user
+    msg['To'] = to_email
+    msg.set_content("Vui lòng xem nội dung email bằng trình duyệt hỗ trợ HTML.")
+    msg.add_alternative(html_body, subtype='html')
+
+    try:
+        context = ssl.create_default_context()
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls(context=context)
+            server.login(smtp_user, smtp_pass)
+            server.send_message(msg)
+        return None  # Thành công
+    except Exception as e:
+        return str(e) # Thất bại
+
+# =========================
+# ! CHỈNH SỬA: TÁC VỤ GỬI BÁO CÁO HÀNG THÁNG
+# =========================
+def send_monthly_report():
+    print(f"[{datetime.now(VN_TZ)}] Running monthly report job...")
+    
+    settings = get_settings()
+
+    # ! MỚI: Kiểm tra xem user có bật tính năng này không
+    if settings.get("enable_monthly_report") != "1":
+        print(f"[{datetime.now(VN_TZ)}] Monthly report is disabled by user. Skipping.")
+        return
+
+    report_email = (settings.get("report_email") or "").strip()
+    if not report_email:
+        print("Report email address is not set. Skipping monthly report.")
+        return
+
+    # Tính toán ngày đầu và cuối của tháng TRƯỚC
+    today = datetime.now(VN_TZ)
+    first_day_of_current_month = today.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    last_day_of_last_month = first_day_of_current_month - timedelta(microseconds=1)
+    first_day_of_last_month = last_day_of_last_month.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    # Chuyển sang UTC để query DB (vì DB lưu UTC)
+    start_utc = first_day_of_last_month.astimezone(timezone.utc).isoformat()
+    end_utc = last_day_of_last_month.astimezone(timezone.utc).isoformat()
+    
+    month_label = first_day_of_last_month.strftime("%m/%Y")
+    print(f"Generating report for month: {month_label}")
+
+    # Query "Doanh thu" (tổng tiền nạp)
+    total_revenue = 0.0
+    total_spent = 0.0
+    details = []
+    
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        
+        # Lấy tổng nạp (doanh thu) và tổng trừ (chi tiêu) theo từng API
+        c.execute("""
+            SELECT 
+                name,
+                SUM(CASE WHEN change_amount > 0 THEN change_amount ELSE 0 END) as revenue,
+                SUM(CASE WHEN change_amount < 0 THEN change_amount ELSE 0 END) as spent
+            FROM balance_history
+            WHERE timestamp >= ? AND timestamp <= ?
+            GROUP BY api_id, name
+            ORDER BY name
+        """, (start_utc, end_utc))
+        
+        rows = c.fetchall()
+        
+    if not rows:
+        print(f"No data found for month {month_label}. Skipping email.")
+        return
+        
+    # Xây dựng nội dung Email
+    body_html = f"""
+    <html>
+    <head>
+        <style>
+            body {{ font-family: Arial, sans-serif; line-height: 1.6; }}
+            .container {{ width: 90%; max-width: 600px; margin: 20px auto; border: 1px solid #ddd; border-radius: 8px; overflow: hidden; }}
+            .header {{ background-color: #020817; color: #fff; padding: 20px; text-align: center; }}
+            .header h1 {{ margin: 0; font-size: 24px; }}
+            .content {{ padding: 30px; }}
+            .content p {{ margin-bottom: 20px; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
+            th, td {{ border: 1px solid #ddd; padding: 10px; text-align: left; }}
+            th {{ background-color: #f4f4f4; }}
+            .total {{ font-weight: bold; font-size: 1.1em; }}
+            .revenue {{ color: #28a745; }}
+            .spent {{ color: #dc3545; }}
+            .footer {{ background-color: #f9f9f9; color: #777; padding: 20px; text-align: center; font-size: 12px; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>Báo cáo Doanh thu Tháng {month_label}</h1>
+            </div>
+            <div class="content">
+                <p>Xin chào Admin,</p>
+                <p>Đây là báo cáo tổng kết biến động số dư (Doanh thu = Tổng tiền nạp)
+                   cho tất cả các API trong tháng <b>{month_label}</b>
+                   (từ {first_day_of_last_month.strftime('%d/%m/%Y')} đến {last_day_of_last_month.strftime('%d/%m/%Y')}).
+                </p>
+                
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Tên API</th>
+                            <th style="text-align: right;">Tổng nạp (Doanh thu)</th>
+                            <th style="text-align: right;">Tổng trừ (Chi tiêu)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+    """
+
+    for row in rows:
+        revenue = float(row['revenue'])
+        spent = float(row['spent'])
+        total_revenue += revenue
+        total_spent += spent
+        body_html += f"""
+                        <tr>
+                            <td>{row['name']}</td>
+                            <td style="text-align: right;" class="revenue">+{fmt_amount(revenue)}</td>
+                            <td style="text-align: right;" class="spent">{fmt_amount(spent)}</td>
+                        </tr>
+        """
+    
+    body_html += f"""
+                        <tr class="total">
+                            <td>TỔNG CỘNG</td>
+                            <td style="text-align: right;" class="revenue">+{fmt_amount(total_revenue)}</td>
+                            <td style="text-align: right;" class="spent">{fmt_amount(total_spent)}</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="footer">
+                <p>Balance Watcher Universe | Bot được phát triển bởi Admin Văn Linh.</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+    # ! CHỈNH SỬA: Dùng helper send_email
+    subject = f"[Báo cáo] Tổng kết Doanh thu {APP_TITLE} tháng {month_label}"
+    error = send_email(report_email, subject, body_html)
+    
+    if error:
+        print(f"Failed to send monthly report email: {error}")
+    else:
+        print(f"Successfully sent monthly report to {report_email}")
+
+
+# =========================
 # AUTH & ROUTES
 # =========================
 def is_logged_in() -> bool:
@@ -956,6 +1230,7 @@ def dashboard():
     bots = get_bots()
     apis_raw = get_apis()
 
+    # ! CHỈNH SỬA: Thêm các trường email + enable/disable vào SettingsObj
     class SettingsObj:
         def __init__(self, d):
             self.default_chat_id = d.get("default_chat_id", "")
@@ -963,6 +1238,12 @@ def dashboard():
             self.last_run = d.get("last_run", "") or ""
             self.poll_interval = d.get("poll_interval", "")
             self.global_threshold = d.get("global_threshold", "")
+            # Mới
+            self.report_email = d.get("report_email", "")
+            self.smtp_server = d.get("smtp_server", "")
+            self.smtp_port = d.get("smtp_port", "")
+            self.smtp_user = d.get("smtp_user", "")
+            self.enable_monthly_report = d.get("enable_monthly_report") == "1" #! MỚI
 
     settings = SettingsObj(settings_raw)
 
@@ -1020,6 +1301,22 @@ def save_settings():
     set_setting("default_bot_id", default_bot_id)
     set_setting("poll_interval", poll_interval)
     set_setting("global_threshold", global_threshold)
+    
+    # ! MỚI: Lưu cài đặt email
+    set_setting("report_email", (request.form.get("report_email") or "").strip())
+    set_setting("smtp_server", (request.form.get("smtp_server") or "").strip())
+    set_setting("smtp_port", (request.form.get("smtp_port") or "").strip())
+    set_setting("smtp_user", (request.form.get("smtp_user") or "").strip())
+    # Chỉ lưu pass nếu nó được nhập (không hiển thị lại pass cũ)
+    smtp_pass = (request.form.get("smtp_pass") or "").strip()
+    if smtp_pass:
+        set_setting("smtp_pass", smtp_pass)
+
+    # ! MỚI: Lưu cài đặt enable/disable
+    # request.form.get('checkbox_name') trả về 'value' (VD: '1') nếu được check, và None nếu không.
+    enable_report = "1" if request.form.get("enable_monthly_report") else "0"
+    set_setting("enable_monthly_report", enable_report)
+
 
     flash("Đã lưu cấu hình hệ thống.", "ok")
     return redirect(url_for("dashboard"))
@@ -1082,6 +1379,40 @@ def test_bot():
     flash("Đã gửi test message đến Telegram.", "ok")
     return redirect(url_for("dashboard"))
 
+# =========================
+# ! MỚI: ROUTE TEST EMAIL
+# =========================
+@app.route("/test_email", methods=["POST"])
+def test_email():
+    if not is_logged_in():
+        return redirect(url_for("login"))
+
+    settings = get_settings()
+    to_email = (settings.get("report_email") or "").strip()
+
+    if not to_email:
+        flash("Vui lòng nhập 'Email nhận báo cáo' và Lưu, trước khi test.", "error")
+        return redirect(url_for("dashboard"))
+
+    subject = f"Email Test từ {APP_TITLE}"
+    html_body = f"""
+    <html><body>
+        <h1>Test thành công!</h1>
+        <p>Đây là email test tự động từ <b>{APP_TITLE}</b>.</p>
+        <p>Nếu bạn nhận được email này, cấu hình SMTP của bạn đã hoạt động chính xác.</p>
+        <p>Bot được phát triển bởi <b>Admin Văn Linh</b>.</p>
+    </body></html>
+    """
+    
+    error = send_email(to_email, subject, html_body)
+    
+    if error:
+        flash(f"Gửi email test thất bại: {error}", "error")
+    else:
+        flash(f"Đã gửi email test thành công đến {to_email}", "ok")
+        
+    return redirect(url_for("dashboard"))
+
 @app.route("/add_api", methods=["POST"])
 def add_api():
     name = (request.form.get("name") or "").strip()
@@ -1103,6 +1434,16 @@ def delete_api(api_id: int):
 # =========================
 # BACKUP & RESTORE (JSON)
 # =========================
+def _get_balance_history(): #! MỚI: helper cho backup
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM balance_history ORDER BY id")
+        rows = c.fetchall()
+        conn.close()
+    return [dict(r) for r in rows]
+
 @app.route("/download_backup")
 def download_backup():
     import json
@@ -1110,14 +1451,15 @@ def download_backup():
         "settings": get_settings(),
         "bots": get_bots(),
         "apis": get_apis(),
+        "history": _get_balance_history(), #! MỚI: backup cả lịch sử
         "generated_at_utc": datetime.utcnow().isoformat() + "Z",
-        "schema_version": 1,
+        "schema_version": 2, #! CHỈNH SỬA:
     }
     backup_json = json.dumps(data, ensure_ascii=False, indent=2)
     return Response(
         backup_json,
         mimetype="application/json",
-        headers={"Content-Disposition": 'attachment; filename="balance_watcher_backup.json"'},
+        headers={"Content-Disposition": 'attachment; filename="balance_watcher_backup_v2.json"'},
     )
 
 @app.route("/download_settings")
@@ -1179,7 +1521,13 @@ def restore_backup():
     # Khôi phục settings
     settings = payload.get("settings", {})
     if isinstance(settings, dict):
-        for k in ["default_chat_id", "default_bot_id", "poll_interval", "global_threshold"]:
+        # ! CHỈNH SỬA: Thêm keys email + enable/disable
+        setting_keys = [
+            "default_chat_id", "default_bot_id", "poll_interval", "global_threshold",
+            "report_email", "smtp_server", "smtp_port", "smtp_user", "smtp_pass",
+            "enable_monthly_report" #! MỚI
+        ]
+        for k in setting_keys:
             if k in settings:
                 set_setting(k, str(settings.get(k) if settings.get(k) is not None else ""))
 
@@ -1187,6 +1535,7 @@ def restore_backup():
     if wipe:
         wipe_table("telegram_bots")
         wipe_table("apis")
+        wipe_table("balance_history") #! MỚI
 
     # Khôi phục bots
     bots = payload.get("bots", [])
@@ -1205,6 +1554,7 @@ def restore_backup():
 
     # Khôi phục apis
     apis = payload.get("apis", [])
+    apis_id_map = {} #! MỚI: Map ID cũ -> ID mới
     if isinstance(apis, list):
         for a in apis:
             try:
@@ -1212,7 +1562,10 @@ def restore_backup():
                 url = (a.get("url") or "").strip()
                 field = (a.get("balance_field") or "").strip()
                 if name and url:
+                    old_id = a.get("id") #! MỚI
                     new_id = add_api_db(name, url, field)
+                    if old_id is not None: #! MỚI
+                        apis_id_map[int(old_id)] = new_id #! MỚI
                     try:
                         last_bal = a.get("last_balance", None)
                         last_chg = a.get("last_change", None)
@@ -1222,6 +1575,25 @@ def restore_backup():
                         pass
             except Exception:
                 continue
+
+    # ! MỚI: Khôi phục Lịch sử (nếu có)
+    history = payload.get("history", [])
+    if isinstance(history, list) and apis_id_map:
+        for h in history:
+            try:
+                old_api_id = h.get("api_id")
+                new_api_id = apis_id_map.get(int(old_api_id))
+                if new_api_id:
+                    log_transaction(
+                        new_api_id,
+                        h.get("name", ""),
+                        h.get("timestamp", ""),
+                        float(h.get("change_amount", 0)),
+                        float(h.get("new_balance", 0))
+                    )
+            except Exception:
+                continue
+
 
     flash("Phục hồi dữ liệu từ JSON thành công.", "ok")
     return redirect(url_for("dashboard"))
@@ -1236,6 +1608,16 @@ def health():
 def init_and_run():
     init_db()
     start_watcher_once()
+    
+    # ! MỚI: Khởi động bộ lập lịch
+    try:
+        scheduler = BackgroundScheduler(daemon=True, timezone=str(VN_TZ))
+        # Chạy vào 2:00 sáng ngày 1 hàng tháng (theo giờ VN)
+        scheduler.add_job(send_monthly_report, 'cron', day=1, hour=2, minute=0)
+        scheduler.start()
+        print("Scheduler started. Monthly report job is scheduled.")
+    except Exception as e:
+        print(f"Error starting scheduler: {e}")
 
 init_and_run()
 
