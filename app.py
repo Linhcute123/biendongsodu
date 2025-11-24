@@ -26,8 +26,8 @@ APP_TITLE = "Balance Watcher Universe"
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "changeme")
 SECRET_KEY = os.getenv("SECRET_KEY", ADMIN_PASSWORD)
 
-# Đường dẫn file backup tự động (Secret File trên Render)
-AUTO_BACKUP_PATH = os.getenv("SECRET_BACKUP_FILE_PATH", "/etc/secrets/backup")
+# Auto Restore tìm file trong thư mục secrets
+SECRET_DIR = "/etc/secrets"
 
 DATA_DIR = "/data"
 if not os.path.isdir(DATA_DIR):
@@ -46,7 +46,7 @@ watcher_running = False
 pinger_started = False 
 
 # =========================
-# Múi giờ Việt Nam
+# HELPER TIME & FORMAT
 # =========================
 try:
     from zoneinfo import ZoneInfo
@@ -71,9 +71,6 @@ def parse_iso_utc(s: str) -> Optional[datetime]:
         return dt
     except Exception: return None
 
-# =========================
-# HELPERS
-# =========================
 def fmt_amount(v: float) -> str:
     try: return f"{float(v):,.0f}đ"
     except: return f"{v}đ"
@@ -86,7 +83,7 @@ def to_float(s: Optional[str], default: Optional[float] = None) -> Optional[floa
     except: return default
 
 # =========================
-# TEMPLATE: LOGIN
+# TEMPLATES
 # =========================
 LOGIN_TEMPLATE = r"""
 <!DOCTYPE html>
@@ -111,8 +108,6 @@ LOGIN_TEMPLATE = r"""
 <body class="flex items-center justify-center">
     <div class="max-w-md w-full mx-4">
         <div class="bg-slate-900/80 border border-slate-700/80 rounded-3xl shadow-2xl p-8 backdrop-blur-xl relative overflow-hidden">
-            <div class="absolute -top-10 -right-10 w-32 h-32 bg-indigo-500/20 rounded-full blur-3xl"></div>
-            <div class="absolute -bottom-16 -left-10 w-40 h-40 bg-fuchsia-500/10 rounded-full blur-3xl"></div>
             <div class="flex items-center gap-3 mb-2 relative z-10">
                 <div class="w-8 h-8 rounded-full bg-gradient-to-tr from-indigo-400 via-sky-400 to-fuchsia-400 flex items-center justify-center text-white text-xl shadow-lg">∞</div>
                 <div class="text-xs uppercase tracking-[0.18em] text-slate-400">Quantum Security Gate</div>
@@ -140,9 +135,6 @@ LOGIN_TEMPLATE = r"""
 </html>
 """
 
-# =========================
-# TEMPLATE: DASHBOARD
-# =========================
 DASHBOARD_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="vi">
@@ -166,7 +158,7 @@ DASHBOARD_TEMPLATE = r"""
         .scrollbar-thin::-webkit-scrollbar-thumb { background-color:rgba(148,163,253,0.4); border-radius:999px; }
     </style>
 </head>
-<body class="p-4 md:p-8">
+<body class="p-4 md:p-8 text-slate-100">
     {% with messages = get_flashed_messages(with_categories=true) %}
       {% if messages %}
         <div class="max-w-6xl mx-auto mb-4 space-y-2">
@@ -193,10 +185,28 @@ DASHBOARD_TEMPLATE = r"""
                 Quantum Dashboard
             </h1>
         </div>
-        <div class="flex flex-col items-end gap-1 text-[10px] text-slate-500">
-            <div>Auto Restore: <span class="{{ 'text-emerald-400' if auto_restore_status == 'Success' else 'text-rose-400' }}">{{ auto_restore_status }}</span></div>
-            <div>Ping Web: <span class="{{ 'text-emerald-400' if ping_active else 'text-slate-600' }}">{{ 'Đang chạy' if ping_active else 'Đã tắt' }}</span></div>
-            <a href="{{ url_for('logout') }}" class="text-slate-500 hover:text-fuchsia-400 transition">Đăng xuất</a>
+        <div class="flex flex-col items-start md:items-end gap-1 text-[10px] text-slate-500">
+            <div>Chu kỳ quét hiện tại: <span class="text-indigo-300 font-semibold">{{ effective_poll_interval }} giây</span></div>
+            <div>Ngưỡng cảnh báo chung: 
+                {% if global_threshold %}
+                    <span class="text-rose-300 font-semibold">{{ "{:,.0f}".format(global_threshold|float) }}đ</span>
+                {% else %}
+                    <span class="text-slate-400">chưa đặt</span>
+                {% endif %}
+            </div>
+            <div>Trạng thái watcher:
+                {% if watcher_running %}
+                    <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-900/60 text-emerald-300 text-[10px]">
+                        <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span> Đang chạy
+                    </span>
+                {% else %}
+                    <span class="inline-flex items-center px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 text-[10px]">Tạm dừng</span>
+                {% endif %}
+            </div>
+            <div>Auto Restore: <span class="{{ 'text-emerald-400' if 'Success' in auto_restore_status else 'text-rose-400' }}">{{ auto_restore_status }}</span></div>
+            <div>Ping Web: <span class="{{ 'text-emerald-400' if ping_active else 'text-slate-600' }}">{{ 'Bật' if ping_active else 'Tắt' }}</span></div>
+            
+            <div><a href="{{ url_for('logout') }}" class="text-slate-500 hover:text-fuchsia-400 transition text-[10px]">Đăng xuất</a></div>
         </div>
     </div>
 
@@ -204,85 +214,102 @@ DASHBOARD_TEMPLATE = r"""
         
         <div class="space-y-5">
             <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
-                <h2 class="text-sm font-semibold text-indigo-300 uppercase tracking-[0.16em] mb-3">Cài đặt & Ping</h2>
+                <h2 class="text-sm font-semibold text-indigo-300 uppercase tracking-[0.16em] mb-3">Cài đặt chung</h2>
+                
                 <form method="post" action="{{ url_for('save_settings') }}" class="space-y-3">
-                    
-                    <div class="space-y-1">
-                        <label class="block text-[10px] text-slate-400">Telegram Chat ID</label>
-                        <input type="text" name="default_chat_id" value="{{ settings.default_chat_id }}" placeholder="ID nhận tin nhắn"
-                            class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500">
-                    </div>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        <div class="md:col-span-2">
+                            <label class="block text-[10px] text-slate-400 mb-1">TELEGRAM_CHAT_ID</label>
+                            <input type="text" name="default_chat_id" value="{{ settings.default_chat_id }}" placeholder="ID nhận tin nhắn"
+                                class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                        </div>
 
-                    <div class="grid grid-cols-2 gap-2">
                         <div>
-                            <label class="block text-[10px] text-slate-400">Chu kỳ quét (s)</label>
+                            <label class="block text-[10px] text-slate-400 mb-1">Bot mặc định (tuỳ chọn)</label>
+                            <select name="default_bot_id" class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                                <option value="">-- Gửi bằng TẤT CẢ --</option>
+                                {% for bot in bots %}
+                                    <option value="{{ bot.id }}" {% if settings.default_bot_id and settings.default_bot_id|string == bot.id|string %}selected{% endif %}>
+                                        {{ bot.bot_name }}
+                                    </option>
+                                {% endfor %}
+                            </select>
+                        </div>
+
+                        <div>
+                            <label class="block text-[10px] text-slate-400 mb-1">Chu kỳ quét (s)</label>
                             <input type="number" name="poll_interval" value="{{ settings.poll_interval }}"
                                 class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500">
                         </div>
-                        <div>
-                            <label class="block text-[10px] text-slate-400">Ngưỡng báo (VND)</label>
+
+                        <div class="md:col-span-2">
+                            <label class="block text-[10px] text-slate-400 mb-1">Ngưỡng cảnh báo chung (VND)</label>
                             <input type="text" name="global_threshold" value="{{ settings.global_threshold }}"
                                 class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 focus:outline-none focus:ring-2 focus:ring-rose-500">
                         </div>
                     </div>
 
-                    <hr class="border-slate-700/60 my-2">
+                    <hr class="border-slate-700/60 my-3">
                     
                     <div class="space-y-2">
-                        <h3 class="text-[11px] font-bold text-emerald-400 uppercase">⚡ Ping Keep-Alive (Chống ngủ)</h3>
+                        <h3 class="text-[11px] font-bold text-emerald-400 uppercase">⚡ Ping Keep-Alive</h3>
                         <div>
-                            <label class="block text-[10px] text-slate-400">Link Web (Ping chính nó)</label>
+                            <label class="block text-[10px] text-slate-400 mb-1">Link Web (Ping chính nó)</label>
                             <input type="text" name="ping_url" value="{{ settings.ping_url }}" placeholder="https://ten-app.onrender.com"
                                 class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-500">
                         </div>
                         <div>
-                            <label class="block text-[10px] text-slate-400">Thời gian Ping (phút)</label>
+                            <label class="block text-[10px] text-slate-400 mb-1">Thời gian Ping (phút)</label>
                             <input type="number" name="ping_interval" value="{{ settings.ping_interval }}" placeholder="VD: 10"
                                 class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-500">
                         </div>
                     </div>
 
                     <button type="submit" class="w-full mt-2 inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-gradient-to-r from-indigo-500 via-sky-500 to-fuchsia-500 text-white text-[11px] font-medium shadow-lg hover:-translate-y-0.5 transition-all">
-                        💾 Lưu cấu hình
+                        💾 Lưu toàn bộ cấu hình
                     </button>
                 </form>
             </div>
 
             <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
-                <h2 class="text-sm font-semibold text-fuchsia-300 uppercase tracking-[0.16em] mb-3">Backup / Restore</h2>
-                <div class="grid grid-cols-2 gap-2 mb-3">
-                    <a href="{{ url_for('download_backup') }}" class="w-full text-center px-4 py-2 rounded-2xl bg-slate-800 text-[10px] border border-slate-600 hover:text-fuchsia-200">📦 Tải Backup</a>
-                    <a href="{{ url_for('download_apis') }}" class="w-full text-center px-4 py-2 rounded-2xl bg-slate-800 text-[10px] border border-slate-600 hover:text-fuchsia-200">🌐 Tải APIs</a>
-                </div>
-                <form method="post" action="{{ url_for('restore_backup') }}" enctype="multipart/form-data" class="space-y-2">
-                    <input type="file" name="backup_file" accept=".json" class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[10px] text-slate-400">
-                    <label class="flex items-center gap-2 text-[10px] text-slate-400">
-                        <input type="checkbox" name="wipe" value="1" class="rounded bg-slate-900"> Xoá dữ liệu cũ
-                    </label>
-                    <button type="submit" class="w-full px-4 py-2 rounded-2xl bg-slate-800 text-fuchsia-400 text-[11px] font-bold border border-slate-700 hover:bg-slate-700">
-                        ♻️ Restore từ File
-                    </button>
-                </form>
-            </div>
-            
-            <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
-                <h2 class="text-sm font-semibold text-cyan-300 uppercase tracking-[0.16em] mb-3">Bot Telegram</h2>
+                <h2 class="text-sm font-semibold text-cyan-300 uppercase tracking-[0.16em] mb-3">Quản lý Bot Telegram</h2>
                 <form method="post" action="{{ url_for('add_bot') }}" class="space-y-2 mb-3">
-                    <input type="text" name="bot_name" placeholder="Tên Bot" required class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500">
-                    <input type="text" name="bot_token" placeholder="Token" required class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500">
-                    <button type="submit" class="w-full px-4 py-2 rounded-2xl bg-cyan-900/50 text-cyan-400 text-[11px] font-bold border border-cyan-700/50 hover:bg-cyan-900/80">➕ Thêm Bot</button>
+                    <input type="text" name="bot_name" placeholder="Tên bot (hiển thị)" required class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500">
+                    <input type="text" name="bot_token" placeholder="Token bot" required class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500">
+                    <button type="submit" class="w-full px-4 py-2 rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-500 text-white text-[11px] font-medium shadow-lg hover:shadow-xl">➕ Thêm Bot</button>
                 </form>
-                <div class="space-y-2 max-h-32 overflow-y-auto scrollbar-thin">
+                <div class="space-y-2 max-h-40 overflow-y-auto scrollbar-thin">
                     {% for bot in bots %}
                     <div class="flex justify-between items-center px-3 py-2 rounded-2xl bg-slate-950/70 border border-slate-800">
                         <div class="text-[10px]">
                             <div class="text-slate-200 font-bold">{{ bot.bot_name }}</div>
                             <div class="text-slate-500">...{{ bot.bot_token[-8:] }}</div>
                         </div>
-                        <form method="post" action="{{ url_for('delete_bot') }}"><input type="hidden" name="bot_id" value="{{ bot.id }}"><button class="text-[10px] text-rose-400 hover:text-rose-300">Xoá</button></form>
+                        <div class="flex gap-2">
+                            <form method="post" action="{{ url_for('delete_bot') }}"><input type="hidden" name="bot_id" value="{{ bot.id }}"><button class="text-[10px] text-rose-400 hover:text-rose-300">Xoá</button></form>
+                        </div>
                     </div>
                     {% endfor %}
                 </div>
+            </div>
+
+            <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
+                <h2 class="text-sm font-semibold text-fuchsia-300 uppercase tracking-[0.16em] mb-3">Backup / Restore</h2>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-2 mb-3">
+                    <a href="{{ url_for('download_backup') }}" class="w-full text-center px-3 py-2 rounded-2xl bg-slate-800 text-[10px] border border-slate-600 hover:text-fuchsia-200">📦 Tải Backup</a>
+                    <a href="{{ url_for('download_settings') }}" class="w-full text-center px-3 py-2 rounded-2xl bg-slate-800 text-[10px] border border-slate-600 hover:text-fuchsia-200">⚙️ Settings</a>
+                    <a href="{{ url_for('download_bots') }}" class="w-full text-center px-3 py-2 rounded-2xl bg-slate-800 text-[10px] border border-slate-600 hover:text-fuchsia-200">🤖 Bots</a>
+                    <a href="{{ url_for('download_apis') }}" class="w-full text-center px-3 py-2 rounded-2xl bg-slate-800 text-[10px] border border-slate-600 hover:text-fuchsia-200 md:col-span-3">🌐 Tải APIs</a>
+                </div>
+                <form method="post" action="{{ url_for('restore_backup') }}" enctype="multipart/form-data" class="space-y-2">
+                    <input type="file" name="backup_file" accept=".json" class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[10px] text-slate-400">
+                    <label class="flex items-center gap-2 text-[10px] text-slate-400">
+                        <input type="checkbox" name="wipe" value="1" class="rounded bg-slate-900"> Xoá hết dữ liệu cũ
+                    </label>
+                    <button type="submit" class="w-full px-4 py-2 rounded-2xl bg-gradient-to-r from-fuchsia-500 to-purple-600 text-white text-[11px] font-medium shadow-lg hover:shadow-xl">
+                        ♻️ Restore từ JSON
+                    </button>
+                </form>
             </div>
         </div>
 
@@ -290,17 +317,17 @@ DASHBOARD_TEMPLATE = r"""
             <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
                 <h2 class="text-sm font-semibold text-sky-300 uppercase tracking-[0.16em] mb-3">Thêm API Theo dõi</h2>
                 <form method="post" action="{{ url_for('add_api') }}" class="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    <input type="text" name="name" placeholder="Tên Shop/Web" required class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-500">
-                    <input type="text" name="url" placeholder="Link API (https://...)" required class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-500">
-                    <input type="text" name="balance_field" placeholder="Trường số dư (balance, data.money...)" class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-500">
-                    <div class="md:col-span-2"><button type="submit" class="w-full px-4 py-2 rounded-2xl bg-sky-600 text-white text-[11px] font-bold shadow-lg hover:bg-sky-500">➕ Thêm API</button></div>
+                    <input type="text" name="name" placeholder="Tên hiển thị (VD: Shop Acc)" required class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-500">
+                    <input type="text" name="url" placeholder="URL API kiểm tra số dư" required class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-500">
+                    <input type="text" name="balance_field" placeholder="Trường số dư (VD: data.balance)" class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-500">
+                    <div class="flex items-end"><button type="submit" class="w-full px-4 py-2 rounded-2xl bg-gradient-to-r from-sky-500 to-indigo-500 text-white text-[11px] font-medium shadow-lg hover:shadow-xl">➕ Thêm API</button></div>
                 </form>
             </div>
 
             <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl overflow-hidden">
                 <div class="flex items-center justify-between mb-3">
-                    <h2 class="text-sm font-semibold text-slate-300 uppercase tracking-[0.16em]">Danh sách API</h2>
-                    <span class="text-[10px] text-slate-500">Cập nhật: {{ last_run_vn }}</span>
+                    <h2 class="text-sm font-semibold text-slate-300 uppercase tracking-[0.16em]">Danh sách API đang theo dõi</h2>
+                    <span class="text-[10px] text-slate-500">Lần chạy gần nhất: <span class="text-sky-300">{{ last_run_vn }}</span></span>
                 </div>
                 <div class="overflow-x-auto scrollbar-thin">
                     <table class="min-w-full text-[10px]">
@@ -310,7 +337,7 @@ DASHBOARD_TEMPLATE = r"""
                                 <th class="px-3 py-2 text-left">Tên</th>
                                 <th class="px-3 py-2 text-left">URL</th>
                                 <th class="px-3 py-2 text-left">Số dư</th>
-                                <th class="px-3 py-2 text-left">Thời gian</th>
+                                <th class="px-3 py-2 text-left">Cập nhật</th>
                                 <th class="px-3 py-2 text-right"></th>
                             </tr>
                         </thead>
@@ -320,10 +347,10 @@ DASHBOARD_TEMPLATE = r"""
                                 <td class="px-3 py-2 text-slate-500">#{{ api.id }}</td>
                                 <td class="px-3 py-2 font-medium text-slate-100">{{ api.name }}</td>
                                 <td class="px-3 py-2 text-slate-500 truncate max-w-[150px]">{{ api.url }}</td>
-                                <td class="px-3 py-2"><span class="px-2 py-0.5 rounded-full bg-emerald-900/40 text-emerald-300">{{ "{:,.0f}".format(api.last_balance|float) if api.last_balance is not none else '---' }}đ</span></td>
+                                <td class="px-3 py-2"><span class="px-2 py-0.5 rounded-full bg-emerald-900/40 text-emerald-300">{{ "{:,.0f}".format(api.last_balance|float) if api.last_balance is not none else 'chưa có' }}đ</span></td>
                                 <td class="px-3 py-2 text-slate-500">{{ api.last_change_vn }}</td>
                                 <td class="px-3 py-2 text-right">
-                                    <form method="post" action="{{ url_for('delete_api', api_id=api.id) }}" onsubmit="return confirm('Xoá?');"><button class="text-rose-400 hover:text-rose-300">✕</button></form>
+                                    <form method="post" action="{{ url_for('delete_api', api_id=api.id) }}" onsubmit="return confirm('Xoá?');"><button class="text-rose-400 hover:text-rose-300">✖</button></form>
                                 </td>
                             </tr>
                             {% else %}
@@ -340,7 +367,7 @@ DASHBOARD_TEMPLATE = r"""
 """
 
 # =========================
-# DATABASE
+# DATABASE & LOGIC
 # =========================
 def init_db():
     with db_lock:
@@ -349,7 +376,7 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS telegram_bots (id INTEGER PRIMARY KEY AUTOINCREMENT, bot_name TEXT, bot_token TEXT UNIQUE)")
         c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
         
-        # Các keys cấu hình
+        # Keys cấu hình
         keys = ["default_chat_id", "default_bot_id", "last_run", "poll_interval", "global_threshold", 
                 "ping_url", "ping_interval"]
         for k in keys:
@@ -399,7 +426,7 @@ def wipe_table(table):
     with db_lock: conn = sqlite3.connect(DB_PATH); c = conn.cursor(); c.execute(f"DELETE FROM {table}"); conn.commit(); conn.close()
 
 # =========================
-# LOGIC XỬ LÝ (BALANCE)
+# LOGIC (XỬ LÝ JSON + GỬI TIN)
 # =========================
 def _get_by_path(data, path):
     if not path: return None
@@ -428,7 +455,7 @@ def send_telegram(tokens, chat_id, text):
         except: pass
 
 # =========================
-# AUTO RESTORE (LOGIC CHÍNH)
+# RESTORE & BACKUP
 # =========================
 def process_restore_json_data(payload: dict, wipe: bool = True):
     if wipe:
@@ -465,23 +492,36 @@ def process_restore_json_data(payload: dict, wipe: bool = True):
 auto_restore_status_msg = "Chưa chạy"
 def attempt_auto_restore():
     global auto_restore_status_msg
-    if not os.path.exists(AUTO_BACKUP_PATH):
-        auto_restore_status_msg = "Không tìm thấy file backup (/etc/secrets/...)"
-        print(f"Auto Restore: File not found at {AUTO_BACKUP_PATH}")
+    
+    file_found = None
+    candidates = ["backup", "backup.json"]
+    for fname in candidates:
+        path = os.path.join(SECRET_DIR, fname)
+        if os.path.exists(path):
+            file_found = path
+            break
+            
+    if not file_found:
+        env_path = os.getenv("SECRET_BACKUP_FILE_PATH")
+        if env_path and os.path.exists(env_path): file_found = env_path
+
+    if not file_found:
+        auto_restore_status_msg = "Không tìm thấy file Secret"
+        print(f"Auto Restore: No backup file found in {SECRET_DIR}")
         return
 
     try:
-        with open(AUTO_BACKUP_PATH, 'r', encoding='utf-8') as f:
+        with open(file_found, 'r', encoding='utf-8') as f:
             data = json.load(f)
         process_restore_json_data(data, wipe=True) 
         auto_restore_status_msg = "Success"
-        print("Auto Restore: Successfully loaded data from Secret file.")
+        print("Auto Restore: Successfully loaded data.")
     except Exception as e:
         auto_restore_status_msg = f"Error: {str(e)}"
         print(f"Auto Restore Failed: {e}")
 
 # =========================
-# THREADS (WATCHER + PINGER)
+# WATCHER & PINGER
 # =========================
 def watcher_loop():
     global watcher_running
@@ -496,7 +536,16 @@ def watcher_loop():
             bots = get_bots()
             chat_id = settings.get("default_chat_id")
             threshold = to_float(settings.get("global_threshold"))
-            tokens = [b["bot_token"] for b in bots]
+            
+            # Logic chọn bot mặc định
+            default_bot_id = settings.get("default_bot_id")
+            tokens = []
+            if default_bot_id:
+                for b in bots:
+                    if str(b["id"]) == str(default_bot_id):
+                        tokens = [b["bot_token"]]
+                        break
+            if not tokens: tokens = [b["bot_token"] for b in bots]
             
             set_setting("last_run", datetime.utcnow().isoformat()+"Z")
 
@@ -566,13 +615,19 @@ def dashboard():
     
     last_run = parse_iso_utc(getattr(settings, 'last_run', ''))
     
+    # Trả về đúng các tham số mà template gốc cần
+    eff_poll = to_float(getattr(settings, 'poll_interval', ''), POLL_INTERVAL_DEFAULT)
+    
     return render_template_string(
         DASHBOARD_TEMPLATE,
         title=APP_TITLE,
         bots=get_bots(),
         apis=[dict(a, last_change_vn=fmt_time_label_vn(parse_iso_utc(a['last_change']))) for a in get_apis()],
         settings=settings,
-        last_run_vn=fmt_time_label_vn(last_run) if last_run else "Chưa chạy",
+        last_run_vn=fmt_time_label_vn(last_run) if last_run else "chưa có",
+        watcher_running=watcher_running,
+        effective_poll_interval=int(eff_poll) if eff_poll else POLL_INTERVAL_DEFAULT,
+        global_threshold=to_float(getattr(settings, 'global_threshold', '')),
         auto_restore_status=auto_restore_status_msg,
         ping_active=bool(getattr(settings, 'ping_url', ''))
     )
@@ -590,11 +645,11 @@ def login():
 def save_settings():
     form = request.form
     set_setting("default_chat_id", form.get("default_chat_id", ""))
+    set_setting("default_bot_id", form.get("default_bot_id", "")) # Đã thêm lại dòng này
     set_setting("poll_interval", form.get("poll_interval", ""))
     set_setting("global_threshold", form.get("global_threshold", ""))
     set_setting("ping_url", form.get("ping_url", ""))
     set_setting("ping_interval", form.get("ping_interval", ""))
-    
     flash("Đã lưu cấu hình", "ok")
     return redirect(url_for("dashboard"))
 
@@ -625,7 +680,17 @@ def delete_api(api_id):
 def download_backup():
     import json
     data = {"settings": get_settings(), "bots": get_bots(), "apis": get_apis(), "history": []}
-    return Response(json.dumps(data, ensure_ascii=False, indent=2), mimetype="application/json", headers={"Content-Disposition": 'attachment; filename="backup.json"'})
+    return Response(json.dumps(data, ensure_ascii=False, indent=2), mimetype="application/json", headers={"Content-Disposition": 'attachment; filename="balance_watcher_backup.json"'})
+
+@app.route("/download_settings")
+def download_settings():
+    import json
+    return Response(json.dumps(get_settings(), ensure_ascii=False, indent=2), mimetype="application/json", headers={"Content-Disposition": 'attachment; filename="settings.json"'})
+
+@app.route("/download_bots")
+def download_bots():
+    import json
+    return Response(json.dumps(get_bots(), ensure_ascii=False, indent=2), mimetype="application/json", headers={"Content-Disposition": 'attachment; filename="bots.json"'})
 
 @app.route("/download_apis")
 def download_apis():
@@ -644,14 +709,17 @@ def restore_backup():
     return redirect(url_for("dashboard"))
 
 # =========================
-# MAIN INIT
+# INIT
 # =========================
 def init_and_run():
-    init_db()
-    attempt_auto_restore() 
-    start_threads()
+    try:
+        init_db()
+        attempt_auto_restore() 
+        start_threads()
+    except Exception as e:
+        print(f"Startup Error: {e}")
 
-# GỌI HÀM INIT Ở NGOÀI IF MAIN ĐỂ GUNICORN CHẠY
+# Khởi chạy ngay khi module load để Gunicorn bắt được
 init_and_run()
 
 if __name__ == "__main__":
