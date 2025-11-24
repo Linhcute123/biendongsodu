@@ -27,7 +27,6 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "changeme")
 SECRET_KEY = os.getenv("SECRET_KEY", ADMIN_PASSWORD)
 
 # Đường dẫn file backup tự động (Secret File trên Render)
-# Bạn cần tạo file tên là "backup" trong phần Secret Files của Render
 AUTO_BACKUP_PATH = os.getenv("SECRET_BACKUP_FILE_PATH", "/etc/secrets/backup")
 
 DATA_DIR = "/data"
@@ -36,7 +35,7 @@ if not os.path.isdir(DATA_DIR):
 DB_PATH = os.path.join(DATA_DIR, "balance_watcher.db")
 
 POLL_INTERVAL_DEFAULT = 30
-PING_INTERVAL_DEFAULT = 10  # Mặc định 10 phút ping 1 lần
+PING_INTERVAL_DEFAULT = 10 
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
@@ -44,7 +43,7 @@ app.secret_key = SECRET_KEY
 db_lock = threading.Lock()
 watcher_started = False
 watcher_running = False
-pinger_started = False  # Cờ chạy luồng Ping
+pinger_started = False 
 
 # =========================
 # Múi giờ Việt Nam
@@ -87,7 +86,7 @@ def to_float(s: Optional[str], default: Optional[float] = None) -> Optional[floa
     except: return default
 
 # =========================
-# TEMPLATE: LOGIN (Giao diện Vũ trụ)
+# TEMPLATE: LOGIN
 # =========================
 LOGIN_TEMPLATE = r"""
 <!DOCTYPE html>
@@ -142,7 +141,7 @@ LOGIN_TEMPLATE = r"""
 """
 
 # =========================
-# TEMPLATE: DASHBOARD (Giao diện Vũ trụ - Đã xóa Email, Thêm Ping)
+# TEMPLATE: DASHBOARD
 # =========================
 DASHBOARD_TEMPLATE = r"""
 <!DOCTYPE html>
@@ -350,7 +349,7 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS telegram_bots (id INTEGER PRIMARY KEY AUTOINCREMENT, bot_name TEXT, bot_token TEXT UNIQUE)")
         c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
         
-        # Các keys cấu hình (đã xóa report_email, smtp_*)
+        # Các keys cấu hình
         keys = ["default_chat_id", "default_bot_id", "last_run", "poll_interval", "global_threshold", 
                 "ping_url", "ping_interval"]
         for k in keys:
@@ -432,14 +431,12 @@ def send_telegram(tokens, chat_id, text):
 # AUTO RESTORE (LOGIC CHÍNH)
 # =========================
 def process_restore_json_data(payload: dict, wipe: bool = True):
-    """Hàm xử lý dữ liệu JSON để nạp vào DB"""
     if wipe:
         wipe_table("telegram_bots")
         wipe_table("apis")
         wipe_table("balance_history")
 
     settings = payload.get("settings", {})
-    # Các key cần restore (bao gồm Ping)
     keys = ["default_chat_id", "default_bot_id", "poll_interval", "global_threshold", "ping_url", "ping_interval"]
     for k in keys:
         if k in settings:
@@ -465,7 +462,6 @@ def process_restore_json_data(payload: dict, wipe: bool = True):
             if nid: log_transaction(nid, h.get("name"), h.get("timestamp"), h.get("change_amount"), h.get("new_balance"))
         except: pass
 
-# TỰ ĐỘNG CHẠY KHI KHỞI ĐỘNG
 auto_restore_status_msg = "Chưa chạy"
 def attempt_auto_restore():
     global auto_restore_status_msg
@@ -477,7 +473,6 @@ def attempt_auto_restore():
     try:
         with open(AUTO_BACKUP_PATH, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        # Auto restore luôn wipe dữ liệu rác để nạp chuẩn từ file
         process_restore_json_data(data, wipe=True) 
         auto_restore_status_msg = "Success"
         print("Auto Restore: Successfully loaded data from Secret file.")
@@ -532,7 +527,6 @@ def watcher_loop():
             time.sleep(poll)
         except: time.sleep(POLL_INTERVAL_DEFAULT)
 
-# PING WEB ĐỂ KHÔNG BỊ DOWN
 def pinger_loop():
     global pinger_started
     pinger_started = True
@@ -547,7 +541,7 @@ def pinger_loop():
                 try: requests.get(url, timeout=10)
                 except: pass
             
-            time.sleep(interval_min * 60) # Đổi ra giây
+            time.sleep(interval_min * 60)
         except: time.sleep(600)
 
 def start_threads():
@@ -572,7 +566,6 @@ def dashboard():
     
     last_run = parse_iso_utc(getattr(settings, 'last_run', ''))
     
-    # Truyền biến ping_active ra template
     return render_template_string(
         DASHBOARD_TEMPLATE,
         title=APP_TITLE,
@@ -599,7 +592,6 @@ def save_settings():
     set_setting("default_chat_id", form.get("default_chat_id", ""))
     set_setting("poll_interval", form.get("poll_interval", ""))
     set_setting("global_threshold", form.get("global_threshold", ""))
-    # Lưu cấu hình Ping
     set_setting("ping_url", form.get("ping_url", ""))
     set_setting("ping_interval", form.get("ping_interval", ""))
     
@@ -656,10 +648,12 @@ def restore_backup():
 # =========================
 def init_and_run():
     init_db()
-    attempt_auto_restore() # Chạy ngay khi khởi động để lấy lại dữ liệu từ Secret File
+    attempt_auto_restore() 
     start_threads()
 
+# GỌI HÀM INIT Ở NGOÀI IF MAIN ĐỂ GUNICORN CHẠY
+init_and_run()
+
 if __name__ == "__main__":
-    init_and_run()
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
